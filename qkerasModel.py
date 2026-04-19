@@ -481,6 +481,10 @@ def main(args):
     os.makedirs(os.path.dirname(os.getcwd() + f"/{tag}_model.png"),
                 exist_ok=True)
 
+    #plot kinematics
+    from util.plotting.kinematics_plotter import kinematics
+    kinematics(X, sampleData, y, "v1", tag)
+
     # ── pT-reweighting  (unchanged) ───────────────────────────────────────────
     thebins    = np.linspace(0, 500, 20)
     bkgPts     = sampleData[y == 0][:, 0]
@@ -631,8 +635,7 @@ if __name__ == "__main__":
     parser.add_argument("BkgTrainFile",          nargs="?", type=str)
     parser.add_argument("sig_jetData_TrainFile", nargs="?", type=str)
     parser.add_argument("bkg_jetData_TrainFile", nargs="?", type=str)
-    parser.add_argument("llpType",               nargs="?", type=str)
-
+  
     args = parser.parse_args()
 
     if args.sanity:
