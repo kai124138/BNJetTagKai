@@ -54,7 +54,7 @@ We have two main sources of background in our data: all jets reconstructed from 
 ## Training QKeras Model:
 
 We can run can run this by passing three arguments the following way:
-`python3 qkerasModel.py "<SignalTrainFile.h5>" "<BackgroundTrainFile.h5>" "<JetData_TrainFile.h5>"`. These files should have resulted from the DataForge.py and/or `removeBackground.py`.
+`python3 qkerasModel.py "<SignalTrainFile.h5>" "<BackgroundTrainFile.h5>" "<Signal_jetData_TrainFile.h5>" "<Background_jetData_TrainFile.h5>"`. These files should have resulted from the DataForge.py and/or `removeBackground.py`.
 The `"<JetData_TrainFile.h5>"` will look something like `"sampleData...h5"` resulting from `DataForge.py'.
 
 
