@@ -156,4 +156,4 @@ if TRACING:
         print(os.getcwd() + f'/LayerTraces/profiling_{LAYER}.png')
         plt.savefig(os.getcwd() + f'/LayerTraces/profiling_{LAYER}.png')   
 
-#hls_model.build(csim=False)
+hls_model.build(csim=False)
