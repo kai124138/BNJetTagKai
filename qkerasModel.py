@@ -452,9 +452,10 @@ def main(args):
     sampleData = np.concatenate((sampleData, sampleDataQCD))
     fullData   = np.concatenate((dataset, sampleData), axis=1)
     np.random.shuffle(fullData)
-    dataset    = fullData[0:, 0:141]
-    sampleData = fullData[0:, 141:]
-
+    dataset = fullData[0:,0:141]
+    LLPfeats = fullData[0:,142:146]
+    sampleData = fullData[0:,146:]
+  
     X = dataset[:, 0 : len(dataset[0]) - 1]
     y = dataset[:, len(dataset[0]) - 1]
     X = X.reshape((X.shape[0], N_PART_PER_JET, N_FEAT))
