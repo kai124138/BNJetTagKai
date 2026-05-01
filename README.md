@@ -26,6 +26,17 @@ Install `micromamba` as your package manager:
    `micromamba env create -f environment.yml`
 5. When finished, activate it with `micromamba activate <env_name>`.
 
+### Install `hls4ml`
+ Under your BNJetTag folder:
+```bash
+micromamba activate <your_environment_name>
+mkdir software #make a directory called software
+cd software # switch directory into software
+git clone https://github.com/fastmachinelearning/hls4ml.git  #clone the hls4ml repo
+cd hls4ml
+pip install -e .     #install it with pip package manager
+```
+
 ## Reconstructing Jets:
 The Ntuples (root files) containing particle data, i.e. events with particles, can be accessed using the grid through LXPLUS or LPC, for instance. You don't need the grid if you are working on UAF or Mulder. Once we can access the Ntuples, we need to extract the particle information and cluster them into jets with the `dataForgeScripts/dataForge.py` script. Such a file can be run using the following command in the terminal with the corresponding arguments: 
 
