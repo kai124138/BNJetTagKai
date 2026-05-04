@@ -128,6 +128,12 @@ QAT_ENABLED = tf.Variable(True, trainable=False, dtype=tf.bool, name="qat_enable
 # are deliberately left in FP32 — <0.5% of params, large ROC-tail gain.
 FP_EDGES = tf.Variable(True, trainable=False, dtype=tf.bool, name="fp_edges")
 
+# ACT_QAT_ENABLED: per-token absmax int8 activation quantization inside BitLinear.
+# BitNet a4.8 (Wang/Ma/Wei 2024, arXiv:2411.04965): W1A8 — every interconnect
+# on the FPGA drops from 32-bit to 8-bit (~4× bandwidth saving).
+ACT_QAT_ENABLED = tf.Variable(False, trainable=False, dtype=tf.bool,
+                               name="act_qat_enabled")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1-BIT PRIMITIVES
@@ -173,6 +179,15 @@ class AbsMeanQuantizer(tf.keras.constraints.Constraint):
         return {"eps": self.eps}
 
 
+def quantize_act_int8(x):
+    """BitNet a4.8 per-token absmax int8 activation quantization with STE.
+    Wang/Ma/Wei (2024), arXiv:2411.04965. Applied only inside BitLinear.call."""
+    s   = tf.reduce_max(tf.abs(x), axis=-1, keepdims=True) / 127.0 + 1e-8
+    xq  = tf.clip_by_value(tf.round(x / s), -127.0, 127.0)
+    # STE: forward uses quantized value, backward flows through as identity
+    return x + tf.stop_gradient(xq * s - x)
+
+
 class BitLinear(Layer):
     """
     A fully-connected layer with ternary {-1, 0, +1} weights.
@@ -215,6 +230,9 @@ class BitLinear(Layer):
         self.built = True
 
     def call(self, x):
+        # Optional int8 activation quantization — BitNet a4.8 (arXiv:2411.04965).
+        # Not applied to Dense edge layers; only to ternary BitLinear projections.
+        x = tf.cond(ACT_QAT_ENABLED, lambda: quantize_act_int8(x), lambda: x)
         # kernel is already ternary (enforced by the constraint after each step)
         # matmul with ternary weights is equivalent to adds/subtracts only
         out = tf.matmul(x, self.kernel)
@@ -733,6 +751,37 @@ def main(args):
         callbacks        = [early_stop],
     )
 
+    # ── Stage 2.5: activation-QAT calibration (W1A8) ─────────────────────────
+    # BitNet a4.8 (arXiv:2411.04965): turn on ACT_QAT_ENABLED for 5% of EPOCHS
+    # at 0.3× LR to calibrate int8 activation scales before AUC fine-tuning.
+    do_act_quant = (not args.baseline) and (args.act_quant == "int8")
+    if do_act_quant:
+        act_epochs = max(1, int(0.05 * EPOCHS))
+        print(f"\n=== Stage 2.5: activation-QAT calibration for {act_epochs} epochs ===")
+        ACT_QAT_ENABLED.assign(True)
+        # Rebuild optimizer at 0.3× LR; keep model weights from Stage 2
+        model.compile(
+            loss      = focal_loss(gamma=1.0, alpha=0.5),
+            optimizer = tf.keras.optimizers.experimental.AdamW(
+                learning_rate = peak_lr * 0.3,
+                weight_decay  = 0.01,
+                beta_2        = 0.95,
+            ),
+            metrics   = ["binary_accuracy"],
+        )
+        model.fit(
+            X, y,
+            initial_epoch    = EPOCHS,
+            epochs           = EPOCHS + act_epochs,
+            batch_size       = BATCH_SIZE,
+            verbose          = 2,
+            sample_weight    = np.asarray(weights),
+            validation_split = 0.20,
+            callbacks        = [],
+        )
+    else:
+        ACT_QAT_ENABLED.assign(False)
+
     # ── Loss curve (concatenated stages) ─────────────────────────────────────
     train_loss = history_fp32.history["loss"]     + history_qat.history["loss"]
     val_loss   = history_fp32.history["val_loss"] + history_qat.history["val_loss"]
@@ -963,8 +1012,19 @@ def sanity_check(fp_edges=True):
     if ternary_ok:
         print("✓  Ternary/FP edge assignment is correct")
 
+    # int8 activation quantization sanity: output must be finite and within ±10× of FP32
+    ACT_QAT_ENABLED.assign(False)
+    out_fp32 = model(dummy, training=False).numpy()
+    ACT_QAT_ENABLED.assign(True)
+    out_int8 = model(dummy, training=False).numpy()
+    ACT_QAT_ENABLED.assign(False)
+    assert np.all(np.isfinite(out_int8)), "int8 path produced non-finite output!"
+    ratio = np.abs(out_int8) / (np.abs(out_fp32) + 1e-8)
+    assert np.all(ratio < 10.0), f"int8/FP32 ratio out of bounds: max={ratio.max():.2f}"
+    print("✓  int8 activation path: finite, within 10× of FP32")
+
     n_params_total = model.count_params()
-    act_str = "32"
+    act_str = "8"
     print(f"\nBitNet jet tagger ready: {n_params_total:,} params, "
           f"{n_ternary_layers} ternary layers, {n_fp_layers} FP layers, "
           f"W1A{act_str}")
@@ -1018,6 +1078,11 @@ if __name__ == "__main__":
                         help="Use stratified 50/50 batches in Stage 3 (default: on)")
     parser.add_argument("--no-stratify", dest="stratify", action="store_false",
                         help="Disable stratified batching in Stage 3")
+    # ── Step 4: activation quantization ──────────────────────────────────────
+    # BitNet a4.8 (arXiv:2411.04965): W1A8 per-token absmax int8 activations
+    parser.add_argument("--act-quant", dest="act_quant",
+                        choices=["fp32", "int8"], default="int8",
+                        help="Activation quantization for BitLinear (default: int8)")
     # ── Positional data files ─────────────────────────────────────────────────
     parser.add_argument("SignalTrainFile",       nargs="?", type=str)
     parser.add_argument("BkgTrainFile",          nargs="?", type=str)
