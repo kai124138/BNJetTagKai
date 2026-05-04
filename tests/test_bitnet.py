@@ -20,6 +20,8 @@ from qkerasModel import (
     AUCReshapingCallback,
     AbsMeanQuantizer,
     BitLinear,
+    BitMHSA,
+    write_hls4ml_config,
     N_PART_PER_JET,
     N_FEAT,
     QAT_ENABLED,
@@ -209,3 +211,117 @@ def test_determinism_no_stoch_round():
     out2 = model(x, training=False).numpy()
     np.testing.assert_array_equal(out1, out2,
         err_msg="Forward passes not deterministic with STOCH_ROUND=False")
+
+
+# ── Test 8: Quantization Variation — V eps differs from Q/K eps ───────────────
+
+def test_qv_eps_stored():
+    """
+    build_bitnet_jet_tagger(v_eps=1e-4) wires a larger eps into every W_v
+    BitLinear while W_q/W_k keep the default 1e-6.
+    Verified by inspecting sub.eps on BitLinear submodules whose name ends
+    in '_Wv' vs '_Wq' / '_Wk'.
+    Huang et al. (2023, arXiv:2307.00331): different eps per projection.
+    """
+    V_EPS = 1e-4
+    model = build_bitnet_jet_tagger(fp_edges=True, v_eps=V_EPS)
+
+    wq_eps_vals, wk_eps_vals, wv_eps_vals = [], [], []
+    for sub in model.submodules:
+        if not isinstance(sub, BitLinear):
+            continue
+        n = sub.name
+        if n.endswith("_Wq"):
+            wq_eps_vals.append(sub.eps)
+        elif n.endswith("_Wk"):
+            wk_eps_vals.append(sub.eps)
+        elif n.endswith("_Wv"):
+            wv_eps_vals.append(sub.eps)
+
+    assert wv_eps_vals, "No W_v BitLinear found — check BitMHSA layer names"
+    assert wq_eps_vals and wk_eps_vals, "No W_q or W_k BitLinear found"
+
+    for eps in wv_eps_vals:
+        assert abs(eps - V_EPS) < 1e-12, \
+            f"W_v eps should be {V_EPS}, got {eps}"
+    for eps in wq_eps_vals + wk_eps_vals:
+        assert abs(eps - 1e-6) < 1e-12, \
+            f"W_q/W_k eps should be 1e-6, got {eps}"
+
+
+# ── Test 9: Stage-2 KD teacher forward is finite ─────────────────────────────
+
+def test_kd_teacher_forward():
+    """
+    A teacher model built from Stage-1 FP32 weights produces finite logits.
+    Mirrors the KD setup in main(): copy weights, freeze, run forward pass.
+    Huang et al. (2023, arXiv:2307.00331).
+    """
+    QAT_ENABLED.assign(False)   # FP32 student first
+    student = build_bitnet_jet_tagger(fp_edges=True)
+
+    # Build FP32 teacher, copy weights
+    teacher = build_bitnet_jet_tagger(fp_edges=True)
+    teacher.set_weights(student.get_weights())
+    teacher.trainable = False
+
+    x = np.random.randn(8, N_PART_PER_JET, N_FEAT).astype(np.float32)
+    t_logit = teacher(x, training=False).numpy()
+    assert np.all(np.isfinite(t_logit)), "Teacher forward pass produced non-finite logits"
+
+    # Ternary student forward
+    QAT_ENABLED.assign(True)
+    s_logit = student(x, training=False).numpy()
+    assert np.all(np.isfinite(s_logit)), "Student forward pass produced non-finite logits"
+
+    # KD MSE loss must be finite and non-negative
+    kd_loss = np.mean((
+        1.0 / (1.0 + np.exp(-s_logit / 2.0)) -
+        1.0 / (1.0 + np.exp(-t_logit / 2.0))
+    ) ** 2)
+    assert np.isfinite(kd_loss) and kd_loss >= 0.0, \
+        f"KD MSE loss is not valid: {kd_loss}"
+
+
+# ── Test 10: HLS4ML config is written with required keys ──────────────────────
+
+def test_hls4ml_config_written(tmp_path, monkeypatch):
+    """
+    write_hls4ml_config() writes a YAML file under bitnet/ with all required
+    top-level keys and correct layer precision entries.
+    """
+    import yaml
+
+    monkeypatch.chdir(tmp_path)   # write into a temp dir, not the repo
+    os.makedirs("bitnet", exist_ok=True)
+
+    QAT_ENABLED.assign(True)
+    model = build_bitnet_jet_tagger(fp_edges=True)
+
+    class _FakeArgs:
+        qv_eps = 2e-6
+
+    cfg_path = write_hls4ml_config(model, _FakeArgs(), tag="test_model",
+                                   act_bits=8, fp_edges=True)
+
+    assert os.path.isfile(cfg_path), f"Config file not found: {cfg_path}"
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f)
+
+    for key in ("backend", "project_name", "part", "hls_config",
+                "model_info", "resource_estimate"):
+        assert key in cfg, f"Missing key '{key}' in HLS4ML config"
+
+    # Ternary layers use ap_int<2>; FP edge layers use ap_fixed<16,6>
+    layer_prec = cfg["hls_config"]["LayerName"]
+    for lname, ldata in layer_prec.items():
+        prec = ldata["Precision"]["weight"]
+        if lname in ("input_proj", "head_fc2"):
+            assert prec == "ap_fixed<16,6>", \
+                f"FP-edge layer {lname} should use ap_fixed<16,6>, got {prec}"
+        else:
+            assert prec == "ap_int<2>", \
+                f"Ternary layer {lname} should use ap_int<2>, got {prec}"
+
+    # Resource estimate must be positive
+    assert cfg["resource_estimate"]["lut_estimate"] > 0

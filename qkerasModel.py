@@ -214,13 +214,18 @@ class BitLinear(Layer):
         units      : output dimensionality
         use_bias   : whether to add a bias term (default True)
         reg        : L1 regularisation strength on the kernel
+        eps        : epsilon added to absmedian scale in the ternary quantizer.
+                     Larger eps → more weights quantized to zero.
+                     Huang et al. (2023, arXiv:2307.00331) recommend a larger
+                     eps for the V projection than for Q/K.
         name       : layer name
     """
-    def __init__(self, units, use_bias=True, reg=L1_REG, **kwargs):
+    def __init__(self, units, use_bias=True, reg=L1_REG, eps=1e-6, **kwargs):
         super().__init__(**kwargs)
         self.units    = units
         self.use_bias = use_bias
         self.reg      = reg
+        self.eps      = eps
 
     def build(self, input_shape):
         in_dim = int(input_shape[-1])
@@ -229,7 +234,7 @@ class BitLinear(Layer):
             shape       = (in_dim, self.units),
             initializer = "glorot_uniform",
             regularizer = l1(self.reg),
-            constraint  = AbsMeanQuantizer(),   # ← forces ternary weights
+            constraint  = AbsMeanQuantizer(eps=self.eps),   # ← forces ternary weights
             trainable   = True,
         )
         if self.use_bias:
@@ -256,7 +261,7 @@ class BitLinear(Layer):
     def get_config(self):
         cfg = super().get_config()
         cfg.update({"units": self.units, "use_bias": self.use_bias,
-                    "reg": self.reg})
+                    "reg": self.reg, "eps": self.eps})
         return cfg
 
 
@@ -312,7 +317,7 @@ class BitMHSA(Layer):
         n_heads  : number of attention heads (d_model % n_heads == 0)
         reg      : L1 regularisation on projection weights
     """
-    def __init__(self, d_model, n_heads, reg=L1_REG, **kwargs):
+    def __init__(self, d_model, n_heads, reg=L1_REG, v_eps=2e-6, **kwargs):
         super().__init__(**kwargs)
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.d_model  = d_model
@@ -320,6 +325,10 @@ class BitMHSA(Layer):
         self.d_head   = d_model // n_heads
         self.scale    = tf.math.sqrt(tf.cast(self.d_head, tf.float32))
         self.reg      = reg
+        # Quantization Variation (Huang et al. 2023, arXiv:2307.00331):
+        # V uses a larger eps than Q/K so its distribution is compressed less
+        # aggressively, preserving attention value resolution.
+        self.v_eps    = v_eps
 
     def build(self, input_shape):
         self.W_q = BitLinear(self.d_model, use_bias=False, reg=self.reg,
@@ -327,7 +336,7 @@ class BitMHSA(Layer):
         self.W_k = BitLinear(self.d_model, use_bias=False, reg=self.reg,
                              name=self.name + "_Wk")
         self.W_v = BitLinear(self.d_model, use_bias=False, reg=self.reg,
-                             name=self.name + "_Wv")
+                             eps=self.v_eps, name=self.name + "_Wv")
         self.W_o = BitLinear(self.d_model, use_bias=True,  reg=self.reg,
                              name=self.name + "_Wo")
         self.built = True
@@ -372,7 +381,7 @@ class BitMHSA(Layer):
     def get_config(self):
         cfg = super().get_config()
         cfg.update({"d_model": self.d_model, "n_heads": self.n_heads,
-                    "reg": self.reg})
+                    "reg": self.reg, "v_eps": self.v_eps})
         return cfg
 
 
@@ -413,18 +422,20 @@ class BitTransformerBlock(Layer):
       x → RMSNorm → BitMHSA → + residual
         → RMSNorm → BitFFN  → + residual
     """
-    def __init__(self, d_model, n_heads, ffn_dim, reg=L1_REG, **kwargs):
+    def __init__(self, d_model, n_heads, ffn_dim, reg=L1_REG, v_eps=2e-6, **kwargs):
         super().__init__(**kwargs)
         self.d_model  = d_model
         self.n_heads  = n_heads
         self.ffn_dim  = ffn_dim
         self.reg      = reg
+        self.v_eps    = v_eps
 
     def build(self, input_shape):
         self.norm1 = RMSNorm(name=self.name + "_norm1")
         self.norm2 = RMSNorm(name=self.name + "_norm2")
         self.attn  = BitMHSA(self.d_model, self.n_heads,
-                              reg=self.reg, name=self.name + "_attn")
+                              reg=self.reg, v_eps=self.v_eps,
+                              name=self.name + "_attn")
         self.ffn   = BitFFN(self.d_model, self.ffn_dim,
                              reg=self.reg, name=self.name + "_ffn")
         self.built = True
@@ -439,7 +450,8 @@ class BitTransformerBlock(Layer):
     def get_config(self):
         cfg = super().get_config()
         cfg.update({"d_model": self.d_model, "n_heads": self.n_heads,
-                    "ffn_dim": self.ffn_dim, "reg": self.reg})
+                    "ffn_dim": self.ffn_dim, "reg": self.reg,
+                    "v_eps": self.v_eps})
         return cfg
 
 
@@ -456,6 +468,7 @@ def build_bitnet_jet_tagger(
     ffn_dim     : int   = FFN_DIM,
     reg         : float = L1_REG,
     fp_edges    : bool  = True,
+    v_eps       : float = 2e-6,
 ) -> Model:
     """
     Build the 1-bit Transformer jet tagger.
@@ -506,6 +519,7 @@ def build_bitnet_jet_tagger(
             n_heads  = n_heads,
             ffn_dim  = ffn_dim,
             reg      = reg,
+            v_eps    = v_eps,
             name     = f"bit_block_{i}"
         )(x)
     # shape: (batch, 10, d_model)
@@ -670,7 +684,10 @@ def sweep_mode(args):
             print(f"\n── sweep lr={lr:.0e}  wd={wd:.0e} ──")
             # Fresh model + optimizer for each config
             QAT_ENABLED.assign(False)
-            m = build_bitnet_jet_tagger(fp_edges=(not args.baseline) and args.fp_edges)
+            m = build_bitnet_jet_tagger(
+                fp_edges = (not args.baseline) and args.fp_edges,
+                v_eps    = 1e-6 if args.baseline else args.qv_eps,
+            )
             m.compile(
                 loss      = focal_loss(gamma=1.0, alpha=0.5),
                 optimizer = tf.keras.optimizers.experimental.AdamW(
@@ -806,6 +823,7 @@ def main(args):
         n_layers = args.n_layers,
         ffn_dim  = args.ffn_dim,
         fp_edges = fp_edges,
+        v_eps    = 1e-6 if args.baseline else args.qv_eps,
     )
     model.summary()
 
@@ -891,16 +909,105 @@ def main(args):
     print(f"\n=== Stage 2: ternary QAT for epochs {warmup_epochs}–{EPOCHS} ===")
     QAT_ENABLED.assign(True)
     STOCH_ROUND.assign((not args.baseline) and args.stoch_round)
-    history_qat = model.fit(
-        X, y,
-        initial_epoch    = warmup_epochs,
-        epochs           = EPOCHS,
-        batch_size       = BATCH_SIZE,
-        verbose          = 2,
-        sample_weight    = np.asarray(weights),
-        validation_split = 0.20,
-        callbacks        = [early_stop],
-    )
+
+    kd_weight = 0.0 if args.baseline else args.kd_weight
+    kd_temp   = args.kd_temp
+    do_kd     = kd_weight > 0.0
+
+    # Validation split boundary — mirrors Keras validation_split=0.20
+    n_val_s2  = int(0.20 * len(X))
+    X_tr_s2   = X[:-n_val_s2].astype(np.float32)
+    y_tr_s2   = y[:-n_val_s2].astype(np.float32)
+    w_tr_s2   = np.asarray(weights)[:-n_val_s2]
+    X_vl_s2   = X[-n_val_s2:].astype(np.float32)
+    y_vl_s2   = y[-n_val_s2:].astype(np.float32)
+
+    train_loss_s2: list = []
+    val_loss_s2:   list = []
+
+    if do_kd:
+        # Knowledge distillation (Huang et al. 2023, arXiv:2307.00331):
+        # Teacher = frozen FP32 copy of the Stage-1 warm-start weights.
+        # Student (ternary) minimises  focal + kd_weight * MSE(σ(s/T), σ(t/T)).
+        print(f"  KD enabled — kd_weight={kd_weight:.2f}  kd_temp={kd_temp:.1f}")
+        QAT_ENABLED.assign(False)           # teacher sees FP32 forward
+        teacher = build_bitnet_jet_tagger(
+            d_model  = args.d_model,
+            n_layers = args.n_layers,
+            ffn_dim  = args.ffn_dim,
+            fp_edges = fp_edges,
+            v_eps    = 0.0 if args.baseline else args.qv_eps,
+        )
+        teacher.set_weights(model.get_weights())  # copy Stage-1 FP32 weights
+        teacher.trainable = False
+        QAT_ENABLED.assign(True)            # student becomes ternary
+
+        focal_fn_s2 = focal_loss(gamma=1.0, alpha=0.5)
+        tr_ds_s2 = (
+            tf.data.Dataset
+            .from_tensor_slices((X_tr_s2, y_tr_s2, w_tr_s2))
+            .shuffle(50_000, reshuffle_each_iteration=True)
+            .batch(BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE)
+        )
+
+        # Reuse the same AdamW optimizer from Stage 1 (iterations carry over)
+        kd_optimizer = model.optimizer
+
+        pat        = 5
+        best_vloss = float("inf")
+        no_improve = 0
+        for epoch in range(warmup_epochs, EPOCHS):
+            batch_losses = []
+            for x_b, y_b, w_b in tr_ds_s2:
+                with tf.GradientTape() as tape:
+                    s_logit = model(x_b, training=True)           # (B,1) student
+                    t_logit = tf.stop_gradient(
+                        teacher(x_b, training=False))             # (B,1) teacher FP32
+                    f_l = focal_fn_s2(y_b, s_logit)
+                    # MSE of soft sigmoid outputs at temperature T
+                    kd_l = tf.reduce_mean(tf.square(
+                        tf.sigmoid(s_logit / kd_temp) -
+                        tf.sigmoid(t_logit / kd_temp)
+                    ))
+                    loss = f_l + kd_weight * kd_l
+                grads = tape.gradient(loss, model.trainable_variables)
+                kd_optimizer.apply_gradients(
+                    zip(grads, model.trainable_variables))
+                batch_losses.append(float(loss))
+
+            ep_loss = float(np.mean(batch_losses))
+            vl_logit = model(X_vl_s2, training=False)
+            vl_loss  = float(focal_fn_s2(y_vl_s2, vl_logit))
+            train_loss_s2.append(ep_loss)
+            val_loss_s2.append(vl_loss)
+            print(f"  ep {epoch+1:3d}/{EPOCHS}  "
+                  f"loss={ep_loss:.4f}  val_loss={vl_loss:.4f}")
+
+            # Manual early stopping on val_loss (patience = pat)
+            if vl_loss < best_vloss:
+                best_vloss = vl_loss
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= pat:
+                    print(f"  Early stopping at epoch {epoch+1}")
+                    break
+        del teacher   # free memory before Stage 2.5
+
+    else:
+        history_qat = model.fit(
+            X, y,
+            initial_epoch    = warmup_epochs,
+            epochs           = EPOCHS,
+            batch_size       = BATCH_SIZE,
+            verbose          = 2,
+            sample_weight    = np.asarray(weights),
+            validation_split = 0.20,
+            callbacks        = [early_stop],
+        )
+        train_loss_s2 = history_qat.history["loss"]
+        val_loss_s2   = history_qat.history["val_loss"]
 
     # Disable stochastic rounding for inference — weights stay ternary but
     # eval passes are deterministic from here onward.
@@ -938,8 +1045,8 @@ def main(args):
         ACT_QAT_ENABLED.assign(False)
 
     # ── Loss curve (concatenated stages) ─────────────────────────────────────
-    train_loss = history_fp32.history["loss"]     + history_qat.history["loss"]
-    val_loss   = history_fp32.history["val_loss"] + history_qat.history["val_loss"]
+    train_loss = history_fp32.history["loss"]     + train_loss_s2
+    val_loss   = history_fp32.history["val_loss"] + val_loss_s2
     plt.figure(figsize=(7, 5), dpi=120)
     plt.plot(train_loss, label="Train")
     plt.plot(val_loss,   label="Validation")
@@ -1129,6 +1236,125 @@ def main(args):
     model.save(os.getcwd() + "/{}_bitnetJetTagModel.h5".format(tag))
     print(f"\nModel saved to {tag}_bitnetJetTagModel.h5")
 
+    # ── HLS4ML config export (optional)  ──────────────────────────────────────
+    if args.export_hls:
+        write_hls4ml_config(model, args, tag,
+                            act_bits=8 if do_act_quant else 32,
+                            fp_edges=fp_edges)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HLS4ML CONFIG EXPORT  (Step 11 / beyond)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_hls4ml_config(model, args, tag, act_bits=8, fp_edges=True):
+    """Write an hls4ml-compatible YAML config and an FPGA resource estimate.
+
+    hls4ml (Fastml, CMS L1T group) consumes this YAML to emit Vivado HLS
+    firmware.  We cannot guarantee bit-perfect synthesis without running
+    hls4ml ourselves, but the config captures every precision decision so
+    a hardware engineer can proceed without re-reading the Python source.
+
+    Reference: Duarte et al. 2018 (JINST 13 P07027); Fahim et al. 2021
+    (arXiv:2101.05108); hls4ml docs at https://fastmachinelearning.org/hls4ml
+    """
+    import yaml
+
+    os.makedirs("bitnet", exist_ok=True)
+    cfg_path = f"bitnet/{tag.replace('/', '_')}_hls4ml_config.yaml"
+
+    # Per-layer precision map
+    # ternary W: ap_int<2> (values -1,0,+1 fit in 2 signed bits)
+    # FP32   W: ap_fixed<16,6> (typical for HLS4ML Dense in L1T context)
+    # int8   A: ap_int<8>
+    # fp32   A: ap_fixed<16,6>
+    w_tern  = "ap_int<2>"
+    w_fp    = "ap_fixed<16,6>"
+    a_str   = f"ap_int<{act_bits}>" if act_bits == 8 else "ap_fixed<16,6>"
+
+    layer_prec = {}
+    fp_names = {"input_proj", "head_fc2"} if fp_edges else set()
+    for layer in model.layers:
+        if not hasattr(layer, "kernel"):
+            continue
+        is_fp = layer.name in fp_names
+        wt    = w_fp if is_fp else w_tern
+        bt    = w_fp  # biases always FP
+        layer_prec[layer.name] = {
+            "Precision": {"weight": wt, "bias": bt, "result": a_str}
+        }
+
+    # Count ternary vs FP params for resource estimate
+    n_ternary_params = sum(
+        int(np.prod(layer.kernel.shape))
+        for layer in model.layers
+        if hasattr(layer, "kernel") and layer.name not in fp_names
+        and isinstance(layer, BitLinear)
+    )
+    n_fp_params = sum(
+        int(np.prod(layer.kernel.shape))
+        for layer in model.layers
+        if hasattr(layer, "kernel") and layer.name in fp_names
+    )
+
+    # Rough FPGA LUT estimate:
+    # ternary multiply = 2 LUTs (compare to 0, negate if -1)
+    # FP16 multiply    ~ 3 DSPs or ~30 LUTs (using LUT mult)
+    # We report LUTs only (no DSPs for ternary path).
+    lut_ternary = n_ternary_params * 2
+    lut_fp      = n_fp_params * 30
+    lut_total   = lut_ternary + lut_fp
+    # VU9P has 1,182,240 LUTs — give usage fraction
+    vu9p_luts   = 1_182_240
+    lut_pct     = 100.0 * lut_total / vu9p_luts
+
+    resource_est = {
+        "device":           "xcvu9p-flgb2104-2L-e",
+        "ternary_params":   int(n_ternary_params),
+        "fp_params":        int(n_fp_params),
+        "lut_estimate":     int(lut_total),
+        "lut_pct_vu9p":     round(lut_pct, 3),
+        "note": ("Ternary weights cost ~2 LUTs each (no DSP). "
+                 "FP layers estimated at 30 LUTs/param. "
+                 "Actual usage depends on pipeline depth and reuse factor."),
+    }
+
+    config = {
+        "backend":      "Vivado",
+        "project_name": "BNJetTag",
+        "output_dir":   "hls4ml_prj",
+        "part":         "xcvu9p-flgb2104-2L-e",
+        "clock_period": 5,
+        "io_type":      "io_stream",
+        "hls_config": {
+            "Model": {
+                "Precision":      a_str,
+                "ReuseFactor":    1,
+                "Strategy":       "Latency",
+            },
+            "LayerName": layer_prec,
+        },
+        "model_info": {
+            "n_params":        model.count_params(),
+            "input_shape":     list(model.input_shape[1:]),
+            "output_shape":    list(model.output_shape[1:]),
+            "weight_bits":     1,
+            "activation_bits": act_bits,
+            "fp_edge_layers":  list(fp_names),
+            "v_eps":           float(getattr(args, "qv_eps", 2e-6)),
+        },
+        "resource_estimate": resource_est,
+    }
+
+    with open(cfg_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    print(f"\nHLS4ML config written to {cfg_path}")
+    print(f"  Estimated LUTs on VU9P: {lut_total:,}  ({lut_pct:.2f}% of {vu9p_luts:,})")
+    print(f"  Weight precision  : ternary={w_tern}  FP-edge={w_fp}")
+    print(f"  Activation precision: {a_str}")
+    return cfg_path
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # QUICK SANITY CHECK  (no data needed)
@@ -1164,10 +1390,17 @@ def sanity_check(fp_edges=True):
         if isinstance(sub, BitLinear):
             sub.kernel.assign(q(sub.kernel))
 
-    # Per-layer table: name, ternary?, params
+    # Build weight-name → submodule map to retrieve eps for nested BitLinear
+    wname_to_sub = {}
+    for sub in model.submodules:
+        for w in sub.weights:
+            if "kernel" in w.name:
+                wname_to_sub[w.name] = sub
+
+    # Per-layer table: name, ternary?, eps, params
     fp_layer_names  = {"input_proj", "head_fc2"} if fp_edges else set()
-    print(f"\n{'Kernel':<40} {'Ternary?':<12} {'Params':>8}")
-    print("-" * 62)
+    print(f"\n{'Kernel':<40} {'Ternary?':<12} {'eps':>8} {'Params':>8}")
+    print("-" * 72)
     n_ternary_layers, n_fp_layers = 0, 0
     ternary_ok = True
     seen = set()
@@ -1181,8 +1414,11 @@ def sanity_check(fp_edges=True):
             unique_v   = np.unique(np.round(vals, 4))
             is_ternary = set(unique_v).issubset({-1.0, 0.0, 1.0})
             is_edge    = any(fp_name in w.name for fp_name in fp_layer_names)
-            tag        = "yes" if is_ternary else "no (FP32)"
-            print(f"  {w.name:<38} {tag:<12} {n_params_w:>8,}")
+            tern_str   = "yes" if is_ternary else "no (FP32)"
+            # Retrieve eps from the actual BitLinear submodule (handles nesting)
+            sub_layer = wname_to_sub.get(w.name)
+            eps_str   = f"{sub_layer.eps:.0e}" if isinstance(sub_layer, BitLinear) else "—"
+            print(f"  {w.name:<38} {tern_str:<12} {eps_str:>8} {n_params_w:>8,}")
             if is_edge:
                 n_fp_layers += 1
                 if is_ternary:
@@ -1207,6 +1443,24 @@ def sanity_check(fp_edges=True):
     ratio = np.abs(out_int8) / (np.abs(out_fp32) + 1e-8)
     assert np.all(ratio < 10.0), f"int8/FP32 ratio out of bounds: max={ratio.max():.2f}"
     print("✓  int8 activation path: finite, within 10× of FP32")
+
+    # FPGA resource estimate (rough); use submodules to capture nested BitLinear
+    n_ternary_params = sum(
+        int(np.prod(sub.kernel.shape))
+        for sub in model.submodules
+        if isinstance(sub, BitLinear) and sub.name not in fp_layer_names
+    )
+    n_fp_params = sum(
+        int(np.prod(layer.kernel.shape))
+        for layer in model.layers
+        if hasattr(layer, "kernel") and layer.name in fp_layer_names
+    )
+    lut_est = n_ternary_params * 2 + n_fp_params * 30
+    print(f"\n  FPGA resource estimate (Xilinx VU9P):")
+    print(f"    ternary params : {n_ternary_params:>7,}  × 2 LUT  = {n_ternary_params*2:>7,} LUTs")
+    print(f"    FP-edge params : {n_fp_params:>7,}  × 30 LUT = {n_fp_params*30:>7,} LUTs")
+    print(f"    total estimate : {lut_est:>7,} LUTs  "
+          f"({100.*lut_est/1_182_240:.2f}% of VU9P)")
 
     n_params_total = model.count_params()
     act_str = "8"
@@ -1288,6 +1542,23 @@ if __name__ == "__main__":
                         help="Weight multiplier for false-negative positives (default: 2.0)")
     parser.add_argument("--reshape-cap", dest="reshape_cap", type=float, default=8.0,
                         help="Maximum cumulative boost per sample (default: 8.0)")
+    # ── Step 10: Quantization Variation (Huang et al. arXiv:2307.00331) ──────
+    parser.add_argument("--qv-eps", dest="qv_eps", type=float, default=2e-6,
+                        help="Absmedian eps for Value projection in BitMHSA; "
+                             "Q/K use 1e-6 (default: 2e-6, arXiv:2307.00331)")
+    # ── Step 10: Stage-2 Knowledge Distillation ───────────────────────────────
+    # Teacher = frozen FP32 Stage-1 model; student minimises focal + KD MSE.
+    # Huang et al. (2023, arXiv:2307.00331).
+    parser.add_argument("--kd-weight", dest="kd_weight", type=float, default=0.3,
+                        help="Weight for KD MSE loss in Stage 2 (default: 0.3; 0 to disable)")
+    parser.add_argument("--no-kd", dest="kd_weight", action="store_const", const=0.0,
+                        help="Disable Stage-2 knowledge distillation")
+    parser.add_argument("--kd-temp", dest="kd_temp", type=float, default=2.0,
+                        help="Temperature for KD soft targets (default: 2.0)")
+    # ── Step 11: HLS4ML export ────────────────────────────────────────────────
+    parser.add_argument("--export-hls", dest="export_hls", action="store_true",
+                        default=False,
+                        help="After training, write hls4ml YAML config + resource estimate")
     # ── Positional data files ─────────────────────────────────────────────────
     parser.add_argument("SignalTrainFile",       nargs="?", type=str)
     parser.add_argument("BkgTrainFile",          nargs="?", type=str)
