@@ -91,6 +91,7 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.regularizers import l1
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import roc_auc_score, roc_curve
 import tensorflow_model_optimization as tfmot
 from tensorflow_model_optimization.python.core.sparsity.keras import (
     prune, pruning_callbacks, pruning_schedule
@@ -502,6 +503,45 @@ def build_bitnet_jet_tagger(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PARTIAL-AUC LOSSES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def pauc_loss_fn(y_true, y_logit, fpr_thresh=0.01):
+    """One-way pAUC surrogate via top-K hard negatives.
+    Yao, Lin, Yang (2022), arXiv:2203.01505. Equivalent to LibAUC pAUCLoss 1-way."""
+    pos      = tf.boolean_mask(y_logit, tf.equal(y_true, 1.0))
+    neg      = tf.boolean_mask(y_logit, tf.equal(y_true, 0.0))
+    K        = tf.maximum(1, tf.cast(
+                   tf.cast(tf.size(neg), tf.float32) * fpr_thresh, tf.int32))
+    hard_neg, _ = tf.math.top_k(neg, k=K)
+    diff     = tf.expand_dims(hard_neg, 0) - tf.expand_dims(pos, 1) + 1.0
+    return tf.reduce_mean(tf.square(tf.nn.relu(diff)))
+
+
+def pauc2way_loss_fn(y_true, y_logit, fpr_thresh=0.01, tpr_floor=0.80):
+    """Two-way pAUC surrogate: hard negatives (top-K FPR) + hard positives (bottom-K TPR).
+    Yang et al. TPAMI 2022, arXiv:2206.11655."""
+    pos      = tf.boolean_mask(y_logit, tf.equal(y_true, 1.0))
+    neg      = tf.boolean_mask(y_logit, tf.equal(y_true, 0.0))
+    K_neg    = tf.maximum(1, tf.cast(
+                   tf.cast(tf.size(neg), tf.float32) * fpr_thresh, tf.int32))
+    K_pos    = tf.maximum(1, tf.cast(
+                   tf.cast(tf.size(pos), tf.float32) * (1.0 - tpr_floor), tf.int32))
+    hard_neg, _ = tf.math.top_k(neg, k=K_neg)
+    # Bottom-K positives: negate, top-K, negate back
+    hard_pos, _ = tf.math.top_k(-pos, k=K_pos)
+    hard_pos    = -hard_pos
+    diff     = tf.expand_dims(hard_neg, 0) - tf.expand_dims(hard_pos, 1) + 1.0
+    return tf.reduce_mean(tf.square(tf.nn.relu(diff)))
+
+
+def _tpr_at_fpr(y_true, y_score, fpr_target):
+    """Return TPR interpolated at fpr_target using the empirical ROC curve."""
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    return float(np.interp(fpr_target, fpr, tpr))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRAINING SCRIPT  (mirrors your original train.py exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -708,25 +748,19 @@ def main(args):
     plt.tight_layout()
     plt.savefig(os.getcwd() + "/{}_bitnetLoss.pdf".format(tag), dpi=120)
 
-    # ── Stage 3: AUC-margin fine-tuning ───────────────────────────────────────
-    # LibAUC AUCMLoss (Yuan et al. NeurIPS 2021) re-implemented in pure TF so it
-    # integrates cleanly with the Keras model via GradientTape.
-    # libauc v1.4.0 is PyTorch-only (hard import of torch); it cannot be called
-    # inside a TF graph.  We mirror the identical closed-form objective here:
-    #
-    #   min_{w,a,b} max_{α≥0}
-    #     (1-p)·E_+[(σ(f)-a)²] + p·E_-[(σ(f)-b)²]
-    #     + 2α·[p(1-p)·m + p·E_-[σ(f)] - (1-p)·E_+[σ(f)]]
-    #     - p(1-p)·α²
-    #
-    # w, a, b : gradient *descent*;  α : gradient *ascent* projected to ≥ 0
-    # QAT stays active (QAT_ENABLED=True) — ternary weights are preserved.
-    # "Targeting FPR≤0.01" means fine-tuning after focal-loss convergence so the
-    # model learns to push signal above background in the low-FPR tail; for a
-    # true pAUC restricted to [0,0.01] swap aucml_loss_fn for a pAUCLoss variant.
-    AUC_EPOCHS = 25
-    LR_AUC     = 5e-5          # well below QAT peak LR — model is near-converged
-    LR_DUAL    = LR_AUC / 500  # much smaller step for the dual variable α
+    # ── Stage 3: AUC fine-tuning ──────────────────────────────────────────────
+    # Three loss modes selected by --auc-loss:
+    #   aucm     : AUC margin loss (Yuan et al. NeurIPS 2021), min-max formulation
+    #   pauc1way : one-way pAUC surrogate at FPR≤α (Yao/Lin/Yang 2022, arXiv:2203.01505)
+    #   pauc2way : two-way pAUC with TPR floor    (Yang et al. TPAMI 2022, arXiv:2206.11655)
+    # QAT stays active — ternary weights are preserved throughout.
+    AUC_EPOCHS  = 25
+    LR_AUC      = 1e-4        # bumped from 5e-5; denser gradients with pAUC
+    LR_DUAL     = LR_AUC / 500
+
+    auc_loss_mode = "aucm" if args.baseline else args.auc_loss
+    fpr_thresh    = args.fpr_thresh
+    tpr_floor     = args.tpr_floor
 
     # Mirror Keras' validation_split=0.20 boundary (last 20% = val, same order)
     n_val_s3 = int(0.20 * len(X))
@@ -735,11 +769,11 @@ def main(args):
     X_vl_s3  = X[-n_val_s3:].astype(np.float32)
     y_vl_s3  = y[-n_val_s3:].astype(np.float32)
 
-    imratio = float(np.mean(y_tr_s3))     # signal fraction in training set
+    imratio = float(np.mean(y_tr_s3))
     p_auc   = tf.constant(imratio, dtype=tf.float32)
     m_auc   = tf.constant(0.7,     dtype=tf.float32)
 
-    # Auxiliary variables for the min-max AUC objective
+    # Auxiliary variables used only by the AUCM min-max path
     a_var     = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="auc_a")
     b_var     = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="auc_b")
     alpha_var = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="auc_alpha")
@@ -772,57 +806,69 @@ def main(args):
         beta_2        = 0.95,
     )
 
-    from sklearn.metrics import roc_auc_score
-
     auc_train_hist, auc_val_hist = [], []
-    print(f"\n=== Stage 3: AUC-margin fine-tuning  {AUC_EPOCHS} epochs "
-          f"(m={m_auc.numpy():.1f}, imratio={imratio:.4f}) ===")
+    print(f"\n=== Stage 3: {auc_loss_mode} fine-tuning  {AUC_EPOCHS} epochs "
+          f"(fpr_thresh={fpr_thresh}, imratio={imratio:.4f}) ===")
 
     for epoch in range(AUC_EPOCHS):
         for x_b, y_b in tr_ds_s3:
-            with tf.GradientTape(persistent=True) as tape:
-                tape.watch([a_var, b_var, alpha_var])
-                y_prob = tf.squeeze(tf.sigmoid(model(x_b, training=True)))
-                loss   = aucml_loss_fn(y_b, y_prob)
+            if auc_loss_mode == "aucm":
+                # AUCM needs a persistent tape for the dual variables
+                with tf.GradientTape(persistent=True) as tape:
+                    tape.watch([a_var, b_var, alpha_var])
+                    y_prob = tf.squeeze(tf.sigmoid(model(x_b, training=True)))
+                    loss   = aucml_loss_fn(y_b, y_prob)
+                grads_model = tape.gradient(loss, model.trainable_variables)
+                grad_a      = tape.gradient(loss, a_var)
+                grad_b      = tape.gradient(loss, b_var)
+                grad_alpha  = tape.gradient(loss, alpha_var)
+                del tape
+                auc_opt_s3.apply_gradients(zip(grads_model, model.trainable_variables))
+                a_var.assign_sub(LR_AUC * grad_a)
+                b_var.assign_sub(LR_AUC * grad_b)
+                alpha_var.assign(tf.maximum(0.0, alpha_var + LR_DUAL * grad_alpha))
+            else:
+                # pAUC paths: no auxiliary variables, simple tape
+                with tf.GradientTape() as tape:
+                    y_logit = tf.squeeze(model(x_b, training=True))
+                    if auc_loss_mode == "pauc2way":
+                        loss = pauc2way_loss_fn(y_b, y_logit, fpr_thresh, tpr_floor)
+                    else:
+                        # One-way pAUC (arXiv:2203.01505) — default
+                        loss = pauc_loss_fn(y_b, y_logit, fpr_thresh)
+                grads_model = tape.gradient(loss, model.trainable_variables)
+                auc_opt_s3.apply_gradients(zip(grads_model, model.trainable_variables))
 
-            grads_model = tape.gradient(loss, model.trainable_variables)
-            grad_a      = tape.gradient(loss, a_var)
-            grad_b      = tape.gradient(loss, b_var)
-            grad_alpha  = tape.gradient(loss, alpha_var)
-            del tape  # release persistent tape immediately
-
-            # Descent on model weights (AdamW keeps its own moment state)
-            auc_opt_s3.apply_gradients(zip(grads_model, model.trainable_variables))
-            # Descent on a, b (plain SGD — they converge fast)
-            a_var.assign_sub(LR_AUC * grad_a)
-            b_var.assign_sub(LR_AUC * grad_b)
-            # Ascent on α, projected onto [0, ∞)
-            alpha_var.assign(tf.maximum(0.0, alpha_var + LR_DUAL * grad_alpha))
-
-        # Epoch-level AUC (subsample training set to keep eval fast)
+        # Epoch-level metrics (subsample training set to keep eval fast)
         tr_prob = tf.sigmoid(model(X_tr_s3[:5000], training=False)).numpy().ravel()
         vl_prob = tf.sigmoid(model(X_vl_s3,        training=False)).numpy().ravel()
         tr_auc  = roc_auc_score(y_tr_s3[:5000], tr_prob)
         vl_auc  = roc_auc_score(y_vl_s3,        vl_prob)
+        vl_tpr1e2 = _tpr_at_fpr(y_vl_s3, vl_prob, 1e-2)
+        vl_tpr1e3 = _tpr_at_fpr(y_vl_s3, vl_prob, 1e-3)
         auc_train_hist.append(tr_auc)
         auc_val_hist.append(vl_auc)
+        if auc_loss_mode == "aucm":
+            extra = f"  a={a_var.numpy():.3f}  b={b_var.numpy():.3f}  α={alpha_var.numpy():.4f}"
+        else:
+            extra = ""
         print(f"  ep {epoch+1:2d}/{AUC_EPOCHS}  "
               f"train_AUC={tr_auc:.4f}  val_AUC={vl_auc:.4f}  "
-              f"a={a_var.numpy():.3f}  b={b_var.numpy():.3f}  "
-              f"α={alpha_var.numpy():.4f}")
+              f"TPR@1e-2={vl_tpr1e2:.4f}  TPR@1e-3={vl_tpr1e3:.4f}{extra}")
 
     # AUC fine-tuning curve
     plt.figure(figsize=(7, 4), dpi=120)
     plt.plot(auc_train_hist, label="Train AUC")
     plt.plot(auc_val_hist,   label="Val   AUC")
-    plt.title("Stage-3 AUC-margin fine-tuning", fontsize=16)
+    plt.title(f"Stage-3 {auc_loss_mode} fine-tuning", fontsize=16)
     plt.xlabel(f"Epoch within Stage 3  (after {EPOCHS} focal-loss epochs)")
     plt.ylabel("AUROC")
     plt.ylim(max(0.80, min(auc_train_hist) - 0.02), 1.0)
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.getcwd() + f"/{tag}_auc_finetune.pdf", dpi=120)
-    print(f"\nStage-3 final val AUC: {vl_auc:.4f}")
+    print(f"\nStage-3 final val AUC: {vl_auc:.4f}  "
+          f"TPR@FPR=1e-2: {vl_tpr1e2:.4f}  TPR@FPR=1e-3: {vl_tpr1e3:.4f}")
 
     # ── Save  ─────────────────────────────────────────────────────────────────
     # model = tfmot.sparsity.keras.strip_pruning(model)  # ← re-enable if pruning
@@ -930,6 +976,16 @@ if __name__ == "__main__":
                         help="Keep input_proj and head_fc2 in FP32 (default: on)")
     parser.add_argument("--no-fp-edges", dest="fp_edges", action="store_false",
                         help="Use ternary BitLinear for input_proj and head_fc2")
+    # ── Step 2: pAUC loss ────────────────────────────────────────────────────
+    # One-way pAUC (arXiv:2203.01505); two-way (arXiv:2206.11655)
+    parser.add_argument("--auc-loss", dest="auc_loss",
+                        choices=["aucm", "pauc1way", "pauc2way"],
+                        default="pauc1way",
+                        help="Stage-3 loss: aucm | pauc1way | pauc2way (default: pauc1way)")
+    parser.add_argument("--fpr-thresh", dest="fpr_thresh", type=float, default=0.01,
+                        help="FPR threshold for pAUC loss (default: 0.01)")
+    parser.add_argument("--tpr-floor", dest="tpr_floor", type=float, default=0.80,
+                        help="TPR floor for two-way pAUC loss (default: 0.80)")
     # ── Positional data files ─────────────────────────────────────────────────
     parser.add_argument("SignalTrainFile",       nargs="?", type=str)
     parser.add_argument("BkgTrainFile",          nargs="?", type=str)
