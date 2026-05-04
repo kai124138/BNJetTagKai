@@ -10,12 +10,35 @@ matplotlib.use("Agg")
 import sys, os, numpy
 import tensorflow
 from qkeras.utils import load_qmodel
+from qkerasModel import (AbsMeanQuantizer, BitLinear, RMSNorm, BitMHSA, BitFFN,
+                         BitTransformerBlock, focal_loss, tfp_median)
+
+# Rebuild the WarmupCosineDecay class so Keras can deserialize the saved model
+import tensorflow as tf
+@tf.keras.utils.register_keras_serializable()
+class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __call__(self, step):
+        return 3e-4
+    def get_config(self):
+        return {}
+
+CUSTOM_OBJECTS = {
+    "AbsMeanQuantizer": AbsMeanQuantizer,
+    "BitLinear": BitLinear,
+    "RMSNorm": RMSNorm,
+    "BitMHSA": BitMHSA,
+    "BitFFN": BitFFN,
+    "BitTransformerBlock": BitTransformerBlock,
+    "WarmupCosineDecay": WarmupCosineDecay,
+    "loss_fn": focal_loss(gamma=1.0, alpha=0.5),
+}
+
 # Establish the input and output data for each dataset, expanding dimensions for compatability with Conv1D layer input
 
 # First Dataset
 #with h5py.File("/data/t3home000/aidandc/testingDataver3HH.h5", "r") as hf:
  #   dataset = hf["Testing Data"][:]
-    
+
 with h5py.File("data/testingDataSig.h5", "r") as hf:
     dataset = hf["Testing Data"][:]
 with h5py.File("data/testingDataQCD.h5", "r") as hf:
@@ -27,8 +50,8 @@ np.random.shuffle(dataset) #shuffling rows
 
 N_PART_PER_JET = 10
 N_FEAT = 14
-A = dataset[:, 0 : len(dataset[0]) - 1]
-b = dataset[:, len(dataset[0]) - 1]
+A = dataset[:, 0 : N_PART_PER_JET * N_FEAT]
+b = dataset[:, N_PART_PER_JET * N_FEAT]
 #A = expand_dims(A, axis=3)
 A = A.reshape((A.shape[0], N_PART_PER_JET, N_FEAT))
 
@@ -61,7 +84,7 @@ plt.figure(1)
 #model1 = load_model("modelOne.h5")
 #model2 = load_model("modelTwo.h5")
 #model3 = load_model("modelThree.h5")
-model1 = load_model("L1JetTagModel.h5")
+model1 = load_model("L1JetTagModel.h5", custom_objects=CUSTOM_OBJECTS)
 
 # Creating ROC curves based on model predictions for each dataset
 Ab_pred_keras = model1.predict(A).ravel()
@@ -79,7 +102,7 @@ plt.plot(fpr_Ab, tpr_Ab, label="Pf, AUC={:.3f}".format(auc_Ab))
 #plt.plot(fpr_Cd, tpr_Cd, label="dZ+dXY 5 Vertex (area={:.3f})".format(auc_Cd))
 
 # Establish labels and save image
-plt.xlabel("Background Efficiency", fontsize=16)
+plt.xlabel("log(Background Efficiency)", fontsize=16)
 plt.ylabel("Signal Efficiency", fontsize=16)
 #plt.axvline(x=0.01, ymin=0, ymax=0.59, color="red")
 #plt.axhline(y=0.6, xmin=0, xmax=0.573, color="red")
