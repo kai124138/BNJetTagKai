@@ -624,6 +624,92 @@ class AUCReshapingCallback(tf.keras.callbacks.Callback):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# LR/WD SWEEP  (BitNet b1.58 Reloaded, arXiv:2407.09527)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sweep_mode(args):
+    """Train a 3×3 LR/WD grid for 10% of EPOCHS; rank by TPR@FPR=1e-2.
+    BitNet b1.58 Reloaded (arXiv:2407.09527): small-net QAT is sensitive to LR/WD."""
+    import csv
+
+    # Load data (same pipeline as main, without kinematics/pT-reweighting)
+    with h5py.File(args.SignalTrainFile,       "r") as hf:
+        dataset    = hf["Training Data"][:]
+    with h5py.File(args.BkgTrainFile,          "r") as hf:
+        datasetQCD = hf["Training Data"][:]
+    with h5py.File(args.sig_jetData_TrainFile, "r") as hf:
+        sampleData = hf["Sample Data"][:]
+    with h5py.File(args.bkg_jetData_TrainFile, "r") as hf:
+        sampleDataQCD = hf["Sample Data"][:]
+
+    dataset    = np.concatenate((dataset, datasetQCD))
+    sampleData = np.concatenate((sampleData, sampleDataQCD))
+    fullData   = np.concatenate((dataset, sampleData), axis=1)
+    np.random.shuffle(fullData)
+    dataset    = fullData[:, 0:141]
+    fullData_X = dataset[:, :-1].reshape(-1, N_PART_PER_JET, N_FEAT).astype(np.float32)
+    fullData_y = dataset[:, -1].astype(np.float32)
+
+    n_val   = int(0.20 * len(fullData_X))
+    X_tr    = fullData_X[:-n_val]
+    y_tr    = fullData_y[:-n_val]
+    X_vl    = fullData_X[-n_val:]
+    y_vl    = fullData_y[-n_val:]
+
+    BATCH_SIZE_SW = 50
+    EPOCHS_SW     = max(1, int(0.10 * 200))   # 10% of 200 = 20 epochs per config
+    lr_grid       = [5e-5, 1e-4, 3e-4]
+    wd_grid       = [1e-3, 1e-2, 5e-2]
+
+    os.makedirs("bitnet", exist_ok=True)
+    csv_path = "bitnet/sweep_results.csv"
+    rows = []
+
+    for lr in lr_grid:
+        for wd in wd_grid:
+            print(f"\n── sweep lr={lr:.0e}  wd={wd:.0e} ──")
+            # Fresh model + optimizer for each config
+            QAT_ENABLED.assign(False)
+            m = build_bitnet_jet_tagger(fp_edges=(not args.baseline) and args.fp_edges)
+            m.compile(
+                loss      = focal_loss(gamma=1.0, alpha=0.5),
+                optimizer = tf.keras.optimizers.experimental.AdamW(
+                    learning_rate = lr, weight_decay = wd, beta_2 = 0.95),
+                metrics   = ["binary_accuracy"],
+            )
+            # Stage 1 (20% of sweep epochs): FP32 warm-start
+            s1_ep = max(1, EPOCHS_SW // 5)
+            m.fit(X_tr, y_tr, epochs=s1_ep, batch_size=BATCH_SIZE_SW,
+                  verbose=0, validation_split=0.10)
+            # Stage 2: ternary QAT
+            QAT_ENABLED.assign(True)
+            hist = m.fit(X_tr, y_tr, initial_epoch=s1_ep, epochs=EPOCHS_SW,
+                         batch_size=BATCH_SIZE_SW, verbose=0, validation_split=0.10)
+
+            vl_prob = tf.sigmoid(m(X_vl, training=False)).numpy().ravel()
+            auroc       = roc_auc_score(y_vl, vl_prob)
+            tpr_1e2     = _tpr_at_fpr(y_vl, vl_prob, 1e-2)
+            tpr_1e3     = _tpr_at_fpr(y_vl, vl_prob, 1e-3)
+            final_vloss = hist.history["val_loss"][-1]
+            rows.append(dict(lr=lr, wd=wd, final_val_loss=final_vloss,
+                             auroc=auroc, tpr_at_fpr_1e2=tpr_1e2,
+                             tpr_at_fpr_1e3=tpr_1e3))
+            print(f"  → AUROC={auroc:.4f}  TPR@1e-2={tpr_1e2:.4f}  TPR@1e-3={tpr_1e3:.4f}")
+
+    # Write CSV
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["lr","wd","final_val_loss","auroc",
+                                           "tpr_at_fpr_1e2","tpr_at_fpr_1e3"])
+        w.writeheader()
+        w.writerows(rows)
+    best = max(rows, key=lambda r: r["tpr_at_fpr_1e2"])
+    print(f"\nSweep results saved to {csv_path}")
+    print(f"Best config: lr={best['lr']:.0e}  wd={best['wd']:.0e}"
+          f"  TPR@1e-2={best['tpr_at_fpr_1e2']:.4f}  AUROC={best['auroc']:.4f}")
+    QAT_ENABLED.assign(True)   # restore for any subsequent run
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRAINING SCRIPT  (mirrors your original train.py exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1140,6 +1226,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--sanity", action="store_true",
                         help="Run shape/weight sanity check (no data needed)")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Run LR/WD grid sweep and write bitnet/sweep_results.csv")
     parser.add_argument("--baseline", action="store_true",
                         help="Reproduce original behaviour byte-for-byte (disables all new features)")
     # ── Architecture flags ────────────────────────────────────────────────────
@@ -1211,6 +1299,11 @@ if __name__ == "__main__":
     if args.sanity:
         fp_edges = (not args.baseline) and args.fp_edges
         sanity_check(fp_edges=fp_edges)
+    elif args.sweep:
+        if not all([args.SignalTrainFile, args.BkgTrainFile,
+                    args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
+            parser.error("Provide all four data file arguments for --sweep")
+        sweep_mode(args)
     else:
         if not all([args.SignalTrainFile, args.BkgTrainFile,
                     args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
