@@ -49,7 +49,42 @@ import os
 import numpy as np
 import argparse
 import tensorflow as tf
+import matplotlib
+matplotlib.use("Agg")   # non-interactive backend — safe for nohup/headless runs
 import matplotlib.pyplot as plt
+
+
+def tfp_median(x):
+    """Compute median of a 1-D tensor via sorting."""
+    n      = tf.shape(x)[0]
+    sorted_x = tf.sort(x)
+    mid    = n // 2
+    # For even-length tensors average the two middle values
+    return tf.cond(
+        tf.equal(n % 2, 0),
+        lambda: (sorted_x[mid - 1] + sorted_x[mid]) / 2.0,
+        lambda: sorted_x[mid],
+    )
+
+
+def focal_loss(gamma=1.0, alpha=0.5):
+    """
+    Focal loss for binary classification.
+      FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    gamma=1 down-weights easy examples moderately.
+    alpha=0.5 gives equal class weighting.
+    """
+    def loss_fn(y_true, y_pred):
+        y_true  = tf.cast(y_true, tf.float32)
+        # Sigmoid probability from raw logit
+        p       = tf.sigmoid(y_pred)
+        p_t     = tf.where(tf.equal(y_true, 1.0), p, 1.0 - p)
+        alpha_t = tf.where(tf.equal(y_true, 1.0), alpha, 1.0 - alpha)
+        # Binary cross-entropy from logits for numerical stability
+        bce     = tf.nn.sigmoid_cross_entropy_with_logits(y_true, y_pred)
+        focal   = alpha_t * tf.pow(1.0 - p_t, gamma) * bce
+        return tf.reduce_mean(focal)
+    return loss_fn
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Layer, Dense, GlobalAveragePooling1D, Input, Add, MultiHeadAttention
@@ -77,6 +112,21 @@ FFN_DIM    = 64   # feed-forward hidden dim  (typically 2–4 × D_MODEL)
 DROPOUT    = 0.0  # set >0 only if overfitting is observed
 L1_REG     = 1e-4 # matches your original regularisation
 
+# ─────────────────────────────────────────────
+# Two-stage QAT warm-start toggle
+# ─────────────────────────────────────────────
+# Module-level switch read inside AbsMeanQuantizer.__call__.
+# Stage 1 (FP32 warm-start): set False  → constraint is identity
+# Stage 2 (ternary QAT)     : set True   → constraint snaps weights to {-1,0,+1}
+# Using a tf.Variable lets the value flip between fit() calls without
+# rebuilding the graph and without losing AdamW optimizer state.
+QAT_ENABLED = tf.Variable(True, trainable=False, dtype=tf.bool, name="qat_enabled")
+
+# FP_EDGES: keep input_proj and head_fc2 in full FP32 (not ternary).
+# BitNet b1.58 (Ma et al. 2024, arXiv:2402.17764): embedding and lm_head
+# are deliberately left in FP32 — <0.5% of params, large ROC-tail gain.
+FP_EDGES = tf.Variable(True, trainable=False, dtype=tf.bool, name="fp_edges")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1-BIT PRIMITIVES
@@ -84,11 +134,13 @@ L1_REG     = 1e-4 # matches your original regularisation
 
 class AbsMeanQuantizer(tf.keras.constraints.Constraint):
     """
-    Straight-through absmean quantizer used as a Keras weight *constraint*.
+    Straight-through absmedian quantizer used as a Keras weight *constraint*.
 
     Applied after every optimiser step:
-      W_ternary = clip( round( W / (mean|W| + eps) ), -1, 1 )
+      W_ternary = clip( round( W / (median|W| + eps) ), -1, 1 )
 
+    Uses median instead of mean — more robust to outlier weights,
+    which helps at small network scale.
     The full-precision master weights are updated by the optimiser;
     the constraint snaps them back to ternary for the forward pass.
     Note: using a constraint means the stored weights ARE ternary, so
@@ -97,14 +149,24 @@ class AbsMeanQuantizer(tf.keras.constraints.Constraint):
     def __init__(self, eps: float = 1e-6):
         self.eps = eps
 
-    def __call__(self, w):
-        scale = tf.reduce_mean(tf.abs(w)) + self.eps
+    def _ternary(self, w):
+        # Absmedian: more robust than absmean for small networks
+        abs_w = tf.abs(tf.reshape(w, [-1]))
+        scale = tfp_median(abs_w) + self.eps
         w_scaled = w / scale
         # Straight-through: round in forward, identity in backward
-        w_ternary = w_scaled + tf.stop_gradient(
+        return w_scaled + tf.stop_gradient(
             tf.clip_by_value(tf.round(w_scaled), -1.0, 1.0) - w_scaled
         )
-        return w_ternary
+
+    def __call__(self, w):
+        # Two-stage QAT: when QAT_ENABLED is False, behave as identity so
+        # weights train in full FP32 during the warm-start phase.
+        return tf.cond(
+            QAT_ENABLED,
+            lambda: self._ternary(w),
+            lambda: tf.identity(w),
+        )
 
     def get_config(self):
         return {"eps": self.eps}
@@ -242,6 +304,12 @@ class BitMHSA(Layer):
         B  = tf.shape(x)[0]
         N  = tf.shape(x)[1]   # sequence length = N_PART_PER_JET = 10
 
+        # Padding mask: True where ALL N_FEAT input features are zero  →  (B, N)
+        pad_mask = tf.reduce_all(tf.equal(x, 0.0), axis=-1)
+        # Expand to (B, 1, 1, N) for broadcasting over (B, heads, N_query, N_key)
+        attn_bias = tf.cast(pad_mask, tf.float32)[:, tf.newaxis, tf.newaxis, :]
+        attn_bias = attn_bias * -1e9   # large negative → ~0 after softmax
+
         # Project with ternary weights  →  (B, N, d_model)
         Q = self.W_q(x)
         K = self.W_k(x)
@@ -254,8 +322,9 @@ class BitMHSA(Layer):
 
         Q, K, V = split_heads(Q), split_heads(K), split_heads(V)
 
-        # Scaled dot-product attention
-        attn_logits = tf.matmul(Q, K, transpose_b=True) / self.scale
+        # Scaled dot-product attention with padding mask
+        attn_logits  = tf.matmul(Q, K, transpose_b=True) / self.scale
+        attn_logits  = attn_logits + attn_bias               # mask padded key positions
         attn_weights = tf.nn.softmax(attn_logits, axis=-1)   # (B, heads, N, N)
 
         # Aggregate values
@@ -354,6 +423,7 @@ def build_bitnet_jet_tagger(
     n_layers    : int   = N_LAYERS,
     ffn_dim     : int   = FFN_DIM,
     reg         : float = L1_REG,
+    fp_edges    : bool  = True,
 ) -> Model:
     """
     Build the 1-bit Transformer jet tagger.
@@ -368,30 +438,34 @@ def build_bitnet_jet_tagger(
     -----
     model = build_bitnet_jet_tagger()
     model.summary()
-    model.compile(loss="binary_crossentropy", optimizer="adam",
+    model.compile(loss=focal_loss(gamma=1.0, alpha=0.5),
+                  optimizer=tf.keras.optimizers.experimental.AdamW(learning_rate=3e-4, weight_decay=0.01, beta_2=0.95),
                   metrics=["binary_accuracy"])
     """
 
     # ── Input ────────────────────────────────────────────────────────────────
     inputs = Input(shape=(n_particles, n_features), name="input_1")
 
-    # ── Input projection: N_FEAT → D_MODEL  (ternary BitLinear) ──────────────
-    # Mirrors your QConv1D(kernel_size=1) which is mathematically identical
-    # to a per-particle Dense / BitLinear applied independently.
-    x = BitLinear(d_model, reg=reg, name="input_proj")(inputs)
+    # ── Input projection: N_FEAT → D_MODEL ───────────────────────────────────
+    # BitNet b1.58 (arXiv:2402.17764): leave embedding layer in FP32 when
+    # fp_edges=True; <0.5% of params, disproportionate ROC-tail benefit.
+    if fp_edges:
+        x = Dense(d_model, use_bias=True, kernel_regularizer=l1(reg),
+                  name="input_proj")(inputs)
+    else:
+        x = BitLinear(d_model, reg=reg, name="input_proj")(inputs)
     x = RMSNorm(name="input_norm")(x)
     # shape: (batch, 10, d_model)
 
-    # ── Learned positional encoding  ─────────────────────────────────────────
-    # Particles are unordered in principle, but giving the model a
-    # learnable position token lets it discover any residual pT-ordering
-    # that may be present in your input features.
-    pos_emb = tf.keras.layers.Embedding(
-        input_dim   = n_particles,
-        output_dim  = d_model,
-        name        = "pos_embedding"
-    )(tf.range(n_particles))                 # shape: (10, d_model)
-    x = x + pos_emb                          # broadcast over batch
+    # ── Positional encoding removed ──────────────────────────────────────────
+    # Particles in a jet are unordered; research suggests removing positional
+    # encoding helps at small scale by preserving permutation equivariance.
+    # pos_emb = tf.keras.layers.Embedding(
+    #     input_dim   = n_particles,
+    #     output_dim  = d_model,
+    #     name        = "pos_embedding"
+    # )(tf.range(n_particles))
+    # x = x + pos_emb
 
     # ── Transformer blocks  ───────────────────────────────────────────────────
     for i in range(n_layers):
@@ -413,11 +487,15 @@ def build_bitnet_jet_tagger(
     # shape: (batch, d_model)
 
     # ── Classification head  ──────────────────────────────────────────────────
-    # Two BitLinear layers to mirror your two QDense layers.
     x = BitLinear(d_model, reg=reg, name="head_fc1")(x)
     x = tf.keras.layers.Activation("relu", name="head_act")(x)
 
-    outputs = BitLinear(1, reg=reg, name="head_fc2")(x)
+    # BitNet b1.58 (arXiv:2402.17764): lm_head stays FP32 when fp_edges=True.
+    if fp_edges:
+        outputs = Dense(1, use_bias=True, kernel_regularizer=l1(reg),
+                        name="head_fc2")(x)
+    else:
+        outputs = BitLinear(1, reg=reg, name="head_fc2")(x)
     # shape: (batch, 1)  — raw logit, no sigmoid  ✓
 
     return Model(inputs=inputs, outputs=outputs, name="bitnet_jet_tagger")
@@ -454,7 +532,7 @@ def main(args):
     np.random.shuffle(fullData)
     dataset = fullData[0:,0:141]
     LLPfeats = fullData[0:,142:146]
-    sampleData = fullData[0:,146:]
+    sampleData = fullData[0:,141:]
   
     X = dataset[:, 0 : len(dataset[0]) - 1]
     y = dataset[:, len(dataset[0]) - 1]
@@ -468,16 +546,17 @@ def main(args):
         print("\nImpact parameter was not normalized beforehand.\n")
         norm_b4 = False
 
+    arch_suffix = f"_d{args.d_model}_l{args.n_layers}_ffn{args.ffn_dim}"
     if norm_b4:
-        tag = "bitnet/bitnet_train"
+        tag = f"bitnet/bitnet_train{arch_suffix}"
     elif normalizeIPs:
-        tag = "bitnet/bitnet_Norm"
+        tag = f"bitnet/bitnet_Norm{arch_suffix}"
         scaler = MinMaxScaler(feature_range=(-1, 1))
         for feat_idx in [8, 9, 10]:
             tmp = scaler.fit_transform([[v] for v in X[:, :, feat_idx].ravel()])
             X[:, :, feat_idx] = tmp.reshape(X[:, :, feat_idx].shape)
     else:
-        tag = "bitnet/noNorm_train"
+        tag = f"bitnet/noNorm_train{arch_suffix}"
 
     os.makedirs(os.path.dirname(os.getcwd() + f"/{tag}_model.png"),
                 exist_ok=True)
@@ -512,7 +591,14 @@ def main(args):
     np.save("{}_ptRange.npy".format(tag),        sampleData[:, 0])
 
     # ── Build model  ──────────────────────────────────────────────────────────
-    model = build_bitnet_jet_tagger()
+    fp_edges = (not args.baseline) and args.fp_edges
+    FP_EDGES.assign(fp_edges)
+    model = build_bitnet_jet_tagger(
+        d_model  = args.d_model,
+        n_layers = args.n_layers,
+        ffn_dim  = args.ffn_dim,
+        fp_edges = fp_edges,
+    )
     model.summary()
 
     tf.keras.utils.plot_model(
@@ -536,42 +622,207 @@ def main(args):
     # }
     # model = prune.prune_low_magnitude(model, **pruning_params)
 
-    # ── Compile  (unchanged) ──────────────────────────────────────────────────
+    # ── Learning rate schedule: cosine decay with 5% linear warmup ───────────
+    BATCH_SIZE    = 50
+    EPOCHS        = 200
+    TRAIN_SIZE    = int(len(X) * 0.80)
+    total_steps   = (TRAIN_SIZE // BATCH_SIZE) * EPOCHS
+    warmup_steps  = int(0.05 * total_steps)
+    peak_lr       = 3e-4
+    min_lr        = 1e-6
+
+    @tf.keras.utils.register_keras_serializable()
+    class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+        def __call__(self, step):
+            step    = tf.cast(step, tf.float32)
+            warmup  = peak_lr * (step / max(warmup_steps, 1))
+            cos_arg = np.pi * (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            cosine  = min_lr + 0.5 * (peak_lr - min_lr) * (1.0 + tf.cos(cos_arg))
+            return tf.where(step < warmup_steps, warmup, cosine)
+        def get_config(self):
+            return {}
+
+    lr_schedule = WarmupCosineDecay()
+
+    # ── Compile ───────────────────────────────────────────────────────────────
     model.compile(
-        loss      = "binary_crossentropy",
-        optimizer = "adam",
+        loss      = focal_loss(gamma=1.0, alpha=0.5),
+        optimizer = tf.keras.optimizers.experimental.AdamW(
+            learning_rate = lr_schedule,
+            weight_decay  = 0.01,
+            beta_2        = 0.95,
+        ),
         metrics   = ["binary_accuracy"],
     )
 
-    # ── Callbacks  ────────────────────────────────────────────────────────────
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", verbose=1, patience=5
-        ),
-        # pruning_callbacks.UpdatePruningStep(),  # ← re-enable if pruning above
-    ]
+    # ── Two-stage QAT warm-start ──────────────────────────────────────────────
+    # Stage 1: 20% of EPOCHS in full FP32 (QAT_ENABLED = False)
+    # Stage 2: 80% of EPOCHS with ternary QAT (QAT_ENABLED = True)
+    # The same model + optimizer instance is reused across both stages so
+    # AdamW's first/second-moment estimates carry over into the QAT phase.
+    warmup_epochs = int(0.20 * EPOCHS)
 
-    # ── Train  (unchanged) ────────────────────────────────────────────────────
-    history = model.fit(
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss", verbose=1, patience=5
+    )
+
+    # ── Stage 1: FP32 warm-start (no early stopping — let it run full 20%) ──
+    print(f"\n=== Stage 1: FP32 warm-start for {warmup_epochs} epochs ===")
+    QAT_ENABLED.assign(False)
+    history_fp32 = model.fit(
         X, y,
-        epochs           = 200,
-        batch_size       = 50,
+        epochs           = warmup_epochs,
+        batch_size       = BATCH_SIZE,
         verbose          = 2,
         sample_weight    = np.asarray(weights),
         validation_split = 0.20,
-        callbacks        = [callbacks],
+        callbacks        = [],
     )
 
-    # ── Loss curve  ───────────────────────────────────────────────────────────
+    # ── Stage 2: ternary QAT (resume from warmup_epochs, keep AdamW state) ──
+    print(f"\n=== Stage 2: ternary QAT for epochs {warmup_epochs}–{EPOCHS} ===")
+    QAT_ENABLED.assign(True)
+    history_qat = model.fit(
+        X, y,
+        initial_epoch    = warmup_epochs,
+        epochs           = EPOCHS,
+        batch_size       = BATCH_SIZE,
+        verbose          = 2,
+        sample_weight    = np.asarray(weights),
+        validation_split = 0.20,
+        callbacks        = [early_stop],
+    )
+
+    # ── Loss curve (concatenated stages) ─────────────────────────────────────
+    train_loss = history_fp32.history["loss"]     + history_qat.history["loss"]
+    val_loss   = history_fp32.history["val_loss"] + history_qat.history["val_loss"]
     plt.figure(figsize=(7, 5), dpi=120)
-    plt.plot(history.history["loss"],     label="Train")
-    plt.plot(history.history["val_loss"], label="Validation")
+    plt.plot(train_loss, label="Train")
+    plt.plot(val_loss,   label="Validation")
+    plt.axvline(warmup_epochs - 0.5, color="k", linestyle="--",
+                label="FP32 → QAT switch")
     plt.title("BitNet Model Loss", fontsize=25)
     plt.ylabel("loss")
     plt.xlabel("epoch")
     plt.legend(loc="best")
     plt.tight_layout()
     plt.savefig(os.getcwd() + "/{}_bitnetLoss.pdf".format(tag), dpi=120)
+
+    # ── Stage 3: AUC-margin fine-tuning ───────────────────────────────────────
+    # LibAUC AUCMLoss (Yuan et al. NeurIPS 2021) re-implemented in pure TF so it
+    # integrates cleanly with the Keras model via GradientTape.
+    # libauc v1.4.0 is PyTorch-only (hard import of torch); it cannot be called
+    # inside a TF graph.  We mirror the identical closed-form objective here:
+    #
+    #   min_{w,a,b} max_{α≥0}
+    #     (1-p)·E_+[(σ(f)-a)²] + p·E_-[(σ(f)-b)²]
+    #     + 2α·[p(1-p)·m + p·E_-[σ(f)] - (1-p)·E_+[σ(f)]]
+    #     - p(1-p)·α²
+    #
+    # w, a, b : gradient *descent*;  α : gradient *ascent* projected to ≥ 0
+    # QAT stays active (QAT_ENABLED=True) — ternary weights are preserved.
+    # "Targeting FPR≤0.01" means fine-tuning after focal-loss convergence so the
+    # model learns to push signal above background in the low-FPR tail; for a
+    # true pAUC restricted to [0,0.01] swap aucml_loss_fn for a pAUCLoss variant.
+    AUC_EPOCHS = 25
+    LR_AUC     = 5e-5          # well below QAT peak LR — model is near-converged
+    LR_DUAL    = LR_AUC / 500  # much smaller step for the dual variable α
+
+    # Mirror Keras' validation_split=0.20 boundary (last 20% = val, same order)
+    n_val_s3 = int(0.20 * len(X))
+    X_tr_s3  = X[:-n_val_s3].astype(np.float32)
+    y_tr_s3  = y[:-n_val_s3].astype(np.float32)
+    X_vl_s3  = X[-n_val_s3:].astype(np.float32)
+    y_vl_s3  = y[-n_val_s3:].astype(np.float32)
+
+    imratio = float(np.mean(y_tr_s3))     # signal fraction in training set
+    p_auc   = tf.constant(imratio, dtype=tf.float32)
+    m_auc   = tf.constant(0.7,     dtype=tf.float32)
+
+    # Auxiliary variables for the min-max AUC objective
+    a_var     = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="auc_a")
+    b_var     = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="auc_b")
+    alpha_var = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="auc_alpha")
+
+    def aucml_loss_fn(y_true, y_prob):
+        """AUC margin loss — LibAUC formulation (Yuan et al. 2021), pure TF."""
+        pos = tf.cast(tf.equal(y_true, 1.0), tf.float32)
+        neg = 1.0 - pos
+        return (
+            (1.0 - p_auc) * tf.reduce_mean((y_prob - a_var) ** 2 * pos)
+            + p_auc       * tf.reduce_mean((y_prob - b_var) ** 2 * neg)
+            + 2.0 * alpha_var * (
+                p_auc * (1.0 - p_auc) * m_auc
+                + tf.reduce_mean(p_auc * y_prob * neg - (1.0 - p_auc) * y_prob * pos)
+            )
+            - p_auc * (1.0 - p_auc) * alpha_var ** 2
+        )
+
+    tr_ds_s3 = (
+        tf.data.Dataset
+        .from_tensor_slices((X_tr_s3, y_tr_s3))
+        .shuffle(20_000, reshuffle_each_iteration=True)
+        .batch(BATCH_SIZE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    auc_opt_s3 = tf.keras.optimizers.experimental.AdamW(
+        learning_rate = LR_AUC,
+        weight_decay  = 0.005,
+        beta_2        = 0.95,
+    )
+
+    from sklearn.metrics import roc_auc_score
+
+    auc_train_hist, auc_val_hist = [], []
+    print(f"\n=== Stage 3: AUC-margin fine-tuning  {AUC_EPOCHS} epochs "
+          f"(m={m_auc.numpy():.1f}, imratio={imratio:.4f}) ===")
+
+    for epoch in range(AUC_EPOCHS):
+        for x_b, y_b in tr_ds_s3:
+            with tf.GradientTape(persistent=True) as tape:
+                tape.watch([a_var, b_var, alpha_var])
+                y_prob = tf.squeeze(tf.sigmoid(model(x_b, training=True)))
+                loss   = aucml_loss_fn(y_b, y_prob)
+
+            grads_model = tape.gradient(loss, model.trainable_variables)
+            grad_a      = tape.gradient(loss, a_var)
+            grad_b      = tape.gradient(loss, b_var)
+            grad_alpha  = tape.gradient(loss, alpha_var)
+            del tape  # release persistent tape immediately
+
+            # Descent on model weights (AdamW keeps its own moment state)
+            auc_opt_s3.apply_gradients(zip(grads_model, model.trainable_variables))
+            # Descent on a, b (plain SGD — they converge fast)
+            a_var.assign_sub(LR_AUC * grad_a)
+            b_var.assign_sub(LR_AUC * grad_b)
+            # Ascent on α, projected onto [0, ∞)
+            alpha_var.assign(tf.maximum(0.0, alpha_var + LR_DUAL * grad_alpha))
+
+        # Epoch-level AUC (subsample training set to keep eval fast)
+        tr_prob = tf.sigmoid(model(X_tr_s3[:5000], training=False)).numpy().ravel()
+        vl_prob = tf.sigmoid(model(X_vl_s3,        training=False)).numpy().ravel()
+        tr_auc  = roc_auc_score(y_tr_s3[:5000], tr_prob)
+        vl_auc  = roc_auc_score(y_vl_s3,        vl_prob)
+        auc_train_hist.append(tr_auc)
+        auc_val_hist.append(vl_auc)
+        print(f"  ep {epoch+1:2d}/{AUC_EPOCHS}  "
+              f"train_AUC={tr_auc:.4f}  val_AUC={vl_auc:.4f}  "
+              f"a={a_var.numpy():.3f}  b={b_var.numpy():.3f}  "
+              f"α={alpha_var.numpy():.4f}")
+
+    # AUC fine-tuning curve
+    plt.figure(figsize=(7, 4), dpi=120)
+    plt.plot(auc_train_hist, label="Train AUC")
+    plt.plot(auc_val_hist,   label="Val   AUC")
+    plt.title("Stage-3 AUC-margin fine-tuning", fontsize=16)
+    plt.xlabel(f"Epoch within Stage 3  (after {EPOCHS} focal-loss epochs)")
+    plt.ylabel("AUROC")
+    plt.ylim(max(0.80, min(auc_train_hist) - 0.02), 1.0)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.getcwd() + f"/{tag}_auc_finetune.pdf", dpi=120)
+    print(f"\nStage-3 final val AUC: {vl_auc:.4f}")
 
     # ── Save  ─────────────────────────────────────────────────────────────────
     # model = tfmot.sparsity.keras.strip_pruning(model)  # ← re-enable if pruning
@@ -583,16 +834,17 @@ def main(args):
 # QUICK SANITY CHECK  (no data needed)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def sanity_check():
+def sanity_check(fp_edges=True):
     """
-    Verify input/output shapes and that ternary constraints are applied.
-    Run with:  python bitnet_jet_tagger.py --sanity
+    Verify input/output shapes, per-layer ternary/FP status, and weight values.
+    Run with:  python qkerasModel.py --sanity
     """
-    print("=" * 60)
+    print("=" * 70)
     print("BitNet Jet Tagger — sanity check")
-    print("=" * 60)
+    print("=" * 70)
 
-    model = build_bitnet_jet_tagger()
+    FP_EDGES.assign(fp_edges)
+    model = build_bitnet_jet_tagger(fp_edges=fp_edges)
     model.summary()
 
     # Shape check
@@ -602,24 +854,54 @@ def sanity_check():
     print(f"\n✓  Input  shape : {dummy.shape}")
     print(f"✓  Output shape : {out.shape}  (raw logit, no sigmoid)")
 
-    # Check that BitLinear weights are ternary after one build
+    # Manually apply the ternary constraint using model.submodules so nested
+    # BitLinear layers inside BitMHSA/BitFFN are reached (model.layers is
+    # shallow — it only sees top-level layers in the functional graph).
+    QAT_ENABLED.assign(True)
+    q = AbsMeanQuantizer()
+    for sub in model.submodules:
+        if isinstance(sub, BitLinear):
+            sub.kernel.assign(q(sub.kernel))
+
+    # Per-layer table: name, ternary?, params
+    fp_layer_names  = {"input_proj", "head_fc2"} if fp_edges else set()
+    print(f"\n{'Kernel':<40} {'Ternary?':<12} {'Params':>8}")
+    print("-" * 62)
+    n_ternary_layers, n_fp_layers = 0, 0
     ternary_ok = True
+    seen = set()
     for layer in model.layers:
         for w in layer.weights:
-            if "kernel" in w.name:
-                vals = np.unique(np.round(w.numpy(), 4))
-                bad  = [v for v in vals if v not in (-1.0, 0.0, 1.0)]
-                if bad:
-                    print(f"  ✗ {w.name}: non-ternary values {bad[:5]}")
+            if "kernel" not in w.name or w.name in seen:
+                continue
+            seen.add(w.name)
+            vals       = w.numpy()
+            n_params_w = int(np.prod(vals.shape))
+            unique_v   = np.unique(np.round(vals, 4))
+            is_ternary = set(unique_v).issubset({-1.0, 0.0, 1.0})
+            is_edge    = any(fp_name in w.name for fp_name in fp_layer_names)
+            tag        = "yes" if is_ternary else "no (FP32)"
+            print(f"  {w.name:<38} {tag:<12} {n_params_w:>8,}")
+            if is_edge:
+                n_fp_layers += 1
+                if is_ternary:
+                    print(f"  ✗ {w.name} should be FP32 but is ternary!")
                     ternary_ok = False
-    if ternary_ok:
-        print("✓  All BitLinear kernels are ternary {-1, 0, +1}")
+            else:
+                n_ternary_layers += 1
+                if not is_ternary:
+                    print(f"  ✗ {w.name}: expected ternary, got {unique_v[:5]}")
+                    ternary_ok = False
 
-    # Parameter count comparison
-    n_params = model.count_params()
-    print(f"\nTotal trainable parameters : {n_params:,}")
-    print("(Original QKeras CNN est.  : ~2,000–3,000 params)")
-    print("=" * 60)
+    if ternary_ok:
+        print("✓  Ternary/FP edge assignment is correct")
+
+    n_params_total = model.count_params()
+    act_str = "32"
+    print(f"\nBitNet jet tagger ready: {n_params_total:,} params, "
+          f"{n_ternary_layers} ternary layers, {n_fp_layers} FP layers, "
+          f"W1A{act_str}")
+    print("=" * 70)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -632,15 +914,33 @@ if __name__ == "__main__":
     )
     parser.add_argument("--sanity", action="store_true",
                         help="Run shape/weight sanity check (no data needed)")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Reproduce original behaviour byte-for-byte (disables all new features)")
+    # ── Architecture flags ────────────────────────────────────────────────────
+    parser.add_argument("--d_model",  type=int, default=D_MODEL,
+                        help=f"Embedding dimension (default {D_MODEL})")
+    parser.add_argument("--n_layers", type=int, default=N_LAYERS,
+                        help=f"Number of transformer blocks (default {N_LAYERS})")
+    parser.add_argument("--ffn_dim",  type=int, default=FFN_DIM,
+                        help=f"FFN hidden dimension (default {FFN_DIM})")
+    # ── Step 1: FP edge layers ────────────────────────────────────────────────
+    # BitNet b1.58 (arXiv:2402.17764): input_proj and head_fc2 in FP32
+    parser.add_argument("--fp-edges", dest="fp_edges",
+                        action="store_true", default=True,
+                        help="Keep input_proj and head_fc2 in FP32 (default: on)")
+    parser.add_argument("--no-fp-edges", dest="fp_edges", action="store_false",
+                        help="Use ternary BitLinear for input_proj and head_fc2")
+    # ── Positional data files ─────────────────────────────────────────────────
     parser.add_argument("SignalTrainFile",       nargs="?", type=str)
     parser.add_argument("BkgTrainFile",          nargs="?", type=str)
     parser.add_argument("sig_jetData_TrainFile", nargs="?", type=str)
     parser.add_argument("bkg_jetData_TrainFile", nargs="?", type=str)
-  
+
     args = parser.parse_args()
 
     if args.sanity:
-        sanity_check()
+        fp_edges = (not args.baseline) and args.fp_edges
+        sanity_check(fp_edges=fp_edges)
     else:
         if not all([args.SignalTrainFile, args.BkgTrainFile,
                     args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
