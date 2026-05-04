@@ -753,6 +753,7 @@ def main(args):
     #   aucm     : AUC margin loss (Yuan et al. NeurIPS 2021), min-max formulation
     #   pauc1way : one-way pAUC surrogate at FPR≤α (Yao/Lin/Yang 2022, arXiv:2203.01505)
     #   pauc2way : two-way pAUC with TPR floor    (Yang et al. TPAMI 2022, arXiv:2206.11655)
+    # Composite loss for pAUC paths: focal + pAUC (Zhu/Wu/Yang 2022, arXiv:2203.14177)
     # QAT stays active — ternary weights are preserved throughout.
     AUC_EPOCHS  = 25
     LR_AUC      = 1e-4        # bumped from 5e-5; denser gradients with pAUC
@@ -761,6 +762,11 @@ def main(args):
     auc_loss_mode = "aucm" if args.baseline else args.auc_loss
     fpr_thresh    = args.fpr_thresh
     tpr_floor     = args.tpr_floor
+    focal_weight  = 0.0 if args.baseline else args.focal_weight
+    pauc_weight   = 1.0 if args.baseline else args.pauc_weight
+    do_stratify   = (not args.baseline) and args.stratify
+
+    focal_fn_s3 = focal_loss(gamma=1.0, alpha=0.5)
 
     # Mirror Keras' validation_split=0.20 boundary (last 20% = val, same order)
     n_val_s3 = int(0.20 * len(X))
@@ -792,13 +798,27 @@ def main(args):
             - p_auc * (1.0 - p_auc) * alpha_var ** 2
         )
 
-    tr_ds_s3 = (
-        tf.data.Dataset
-        .from_tensor_slices((X_tr_s3, y_tr_s3))
-        .shuffle(20_000, reshuffle_each_iteration=True)
-        .batch(BATCH_SIZE)
-        .prefetch(tf.data.AUTOTUNE)
-    )
+    # Stratified 50/50 batches — Zhu/Wu/Yang arXiv:2203.14177
+    steps_per_epoch = max(1, len(X_tr_s3) // BATCH_SIZE)
+    if do_stratify:
+        pos_ds = tf.data.Dataset.from_tensor_slices(
+            (X_tr_s3[y_tr_s3 == 1], y_tr_s3[y_tr_s3 == 1])
+        ).shuffle(20_000).repeat()
+        neg_ds = tf.data.Dataset.from_tensor_slices(
+            (X_tr_s3[y_tr_s3 == 0], y_tr_s3[y_tr_s3 == 0])
+        ).shuffle(20_000).repeat()
+        tr_ds_s3 = (
+            tf.data.Dataset.sample_from_datasets([pos_ds, neg_ds], weights=[0.5, 0.5])
+            .batch(BATCH_SIZE).take(steps_per_epoch).prefetch(tf.data.AUTOTUNE)
+        )
+    else:
+        tr_ds_s3 = (
+            tf.data.Dataset
+            .from_tensor_slices((X_tr_s3, y_tr_s3))
+            .shuffle(20_000, reshuffle_each_iteration=True)
+            .batch(BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE)
+        )
 
     auc_opt_s3 = tf.keras.optimizers.experimental.AdamW(
         learning_rate = LR_AUC,
@@ -808,7 +828,8 @@ def main(args):
 
     auc_train_hist, auc_val_hist = [], []
     print(f"\n=== Stage 3: {auc_loss_mode} fine-tuning  {AUC_EPOCHS} epochs "
-          f"(fpr_thresh={fpr_thresh}, imratio={imratio:.4f}) ===")
+          f"(fpr_thresh={fpr_thresh}, stratify={do_stratify}, "
+          f"focal_w={focal_weight}, pauc_w={pauc_weight}) ===")
 
     for epoch in range(AUC_EPOCHS):
         for x_b, y_b in tr_ds_s3:
@@ -828,14 +849,14 @@ def main(args):
                 b_var.assign_sub(LR_AUC * grad_b)
                 alpha_var.assign(tf.maximum(0.0, alpha_var + LR_DUAL * grad_alpha))
             else:
-                # pAUC paths: no auxiliary variables, simple tape
+                # Composite loss: focal + pAUC (arXiv:2203.14177)
                 with tf.GradientTape() as tape:
                     y_logit = tf.squeeze(model(x_b, training=True))
                     if auc_loss_mode == "pauc2way":
-                        loss = pauc2way_loss_fn(y_b, y_logit, fpr_thresh, tpr_floor)
+                        p_loss = pauc2way_loss_fn(y_b, y_logit, fpr_thresh, tpr_floor)
                     else:
-                        # One-way pAUC (arXiv:2203.01505) — default
-                        loss = pauc_loss_fn(y_b, y_logit, fpr_thresh)
+                        p_loss = pauc_loss_fn(y_b, y_logit, fpr_thresh)
+                    loss = focal_weight * focal_fn_s3(y_b, y_logit) + pauc_weight * p_loss
                 grads_model = tape.gradient(loss, model.trainable_variables)
                 auc_opt_s3.apply_gradients(zip(grads_model, model.trainable_variables))
 
@@ -986,6 +1007,17 @@ if __name__ == "__main__":
                         help="FPR threshold for pAUC loss (default: 0.01)")
     parser.add_argument("--tpr-floor", dest="tpr_floor", type=float, default=0.80,
                         help="TPR floor for two-way pAUC loss (default: 0.80)")
+    # ── Step 3: composite loss + stratified sampling ──────────────────────────
+    # Benchmarking Deep AUROC (Zhu/Wu/Yang 2022, arXiv:2203.14177)
+    parser.add_argument("--focal-weight", dest="focal_weight", type=float, default=0.3,
+                        help="Focal component weight in composite Stage-3 loss (default: 0.3)")
+    parser.add_argument("--pauc-weight", dest="pauc_weight", type=float, default=0.7,
+                        help="pAUC component weight in composite Stage-3 loss (default: 0.7)")
+    parser.add_argument("--stratify", dest="stratify",
+                        action="store_true", default=True,
+                        help="Use stratified 50/50 batches in Stage 3 (default: on)")
+    parser.add_argument("--no-stratify", dest="stratify", action="store_false",
+                        help="Disable stratified batching in Stage 3")
     # ── Positional data files ─────────────────────────────────────────────────
     parser.add_argument("SignalTrainFile",       nargs="?", type=str)
     parser.add_argument("BkgTrainFile",          nargs="?", type=str)
