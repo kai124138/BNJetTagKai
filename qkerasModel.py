@@ -573,6 +573,57 @@ def _tpr_at_fpr(y_true, y_score, fpr_target):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# AUC-RESHAPING CALLBACK
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AUCReshapingCallback(tf.keras.callbacks.Callback):
+    """Per-epoch positive reweighting at the operating FPR point.
+
+    After each Stage-3 epoch:
+      1. Compute score threshold τ that achieves FPR = fpr_thresh on validation.
+      2. Identify positive training samples with score < τ (false negatives).
+      3. Multiply their sample_weight by `boost`, clamped at `cap`.
+
+    Panambur et al. (2023), DOI 10.1038/s41598-023-48482-x.
+    """
+
+    def __init__(self, model, X_tr, y_tr, X_vl, y_vl,
+                 fpr_thresh=0.01, boost=2.0, cap=8.0):
+        super().__init__()
+        self._model     = model
+        self.X_tr       = X_tr
+        self.y_tr       = y_tr
+        self.X_vl       = X_vl
+        self.y_vl       = y_vl
+        self.fpr_thresh = fpr_thresh
+        self.boost      = boost
+        self.cap        = cap
+        self.sample_weights = np.ones(len(y_tr), dtype=np.float32)
+        self.tau        = None
+
+    def on_epoch_end(self, epoch, logs=None):
+        # Find τ: smallest threshold at which val FPR ≤ fpr_thresh
+        vl_score = tf.sigmoid(
+            self._model(self.X_vl, training=False)).numpy().ravel()
+        fpr_arr, _, thresh_arr = roc_curve(
+            self.y_vl, vl_score, drop_intermediate=False)
+        idx = int(np.searchsorted(fpr_arr, self.fpr_thresh, side="right")) - 1
+        idx = max(0, min(idx, len(thresh_arr) - 1))
+        self.tau = float(thresh_arr[idx])
+
+        # Score positive training samples
+        pos_mask = self.y_tr == 1.0
+        tr_score = tf.sigmoid(
+            self._model(self.X_tr, training=False)).numpy().ravel()
+        fn_mask = pos_mask & (tr_score < self.tau)
+
+        # Boost false-negative positives; clamp cumulative boost at cap
+        self.sample_weights[fn_mask] = np.minimum(
+            self.sample_weights[fn_mask] * self.boost, self.cap
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRAINING SCRIPT  (mirrors your original train.py exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -893,12 +944,37 @@ def main(args):
         beta_2        = 0.95,
     )
 
+    # AUC-Reshaping callback (Panambur et al. 2023, DOI 10.1038/s41598-023-48482-x)
+    do_reshape   = (not args.baseline) and args.reshape
+    reshape_cb   = AUCReshapingCallback(
+        model       = model,
+        X_tr        = X_tr_s3,
+        y_tr        = y_tr_s3,
+        X_vl        = X_vl_s3,
+        y_vl        = y_vl_s3,
+        fpr_thresh  = fpr_thresh,
+        boost       = args.reshape_boost,
+        cap         = args.reshape_cap,
+    ) if do_reshape else None
+
     auc_train_hist, auc_val_hist = [], []
     print(f"\n=== Stage 3: {auc_loss_mode} fine-tuning  {AUC_EPOCHS} epochs "
           f"(fpr_thresh={fpr_thresh}, stratify={do_stratify}, "
-          f"focal_w={focal_weight}, pauc_w={pauc_weight}) ===")
+          f"focal_w={focal_weight}, pauc_w={pauc_weight}, reshape={do_reshape}) ===")
 
     for epoch in range(AUC_EPOCHS):
+        # Rebuild dataset with reshape weights if requested (after first epoch)
+        if do_reshape and epoch > 0:
+            sw  = reshape_cb.sample_weights
+            probs = sw / sw.sum()
+            idx_r = np.random.choice(len(X_tr_s3), size=steps_per_epoch * BATCH_SIZE,
+                                     p=probs)
+            tr_ds_s3 = (
+                tf.data.Dataset
+                .from_tensor_slices((X_tr_s3[idx_r], y_tr_s3[idx_r]))
+                .batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+            )
+
         for x_b, y_b in tr_ds_s3:
             if auc_loss_mode == "aucm":
                 # AUCM needs a persistent tape for the dual variables
@@ -943,6 +1019,10 @@ def main(args):
         print(f"  ep {epoch+1:2d}/{AUC_EPOCHS}  "
               f"train_AUC={tr_auc:.4f}  val_AUC={vl_auc:.4f}  "
               f"TPR@1e-2={vl_tpr1e2:.4f}  TPR@1e-3={vl_tpr1e3:.4f}{extra}")
+
+        # Update reshape weights for next epoch
+        if do_reshape:
+            reshape_cb.on_epoch_end(epoch)
 
     # AUC fine-tuning curve
     plt.figure(figsize=(7, 4), dpi=120)
@@ -1109,6 +1189,17 @@ if __name__ == "__main__":
                         help="Stochastic rounding in ternary STE during training (default: on)")
     parser.add_argument("--no-stoch-round", dest="stoch_round", action="store_false",
                         help="Use deterministic rounding in ternary STE")
+    # ── Step 6: AUCReshaping callback ─────────────────────────────────────────
+    # Panambur et al. (2023), DOI 10.1038/s41598-023-48482-x
+    parser.add_argument("--reshape", dest="reshape",
+                        action="store_true", default=True,
+                        help="Enable AUCReshaping per-epoch positive reweighting (default: on)")
+    parser.add_argument("--no-reshape", dest="reshape", action="store_false",
+                        help="Disable AUCReshaping callback")
+    parser.add_argument("--reshape-boost", dest="reshape_boost", type=float, default=2.0,
+                        help="Weight multiplier for false-negative positives (default: 2.0)")
+    parser.add_argument("--reshape-cap", dest="reshape_cap", type=float, default=8.0,
+                        help="Maximum cumulative boost per sample (default: 8.0)")
     # ── Positional data files ─────────────────────────────────────────────────
     parser.add_argument("SignalTrainFile",       nargs="?", type=str)
     parser.add_argument("BkgTrainFile",          nargs="?", type=str)
