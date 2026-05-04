@@ -134,6 +134,13 @@ FP_EDGES = tf.Variable(True, trainable=False, dtype=tf.bool, name="fp_edges")
 ACT_QAT_ENABLED = tf.Variable(False, trainable=False, dtype=tf.bool,
                                name="act_qat_enabled")
 
+# STOCH_ROUND: stochastic rounding in the ternary STE during training.
+# Rounds up with probability = fractional part — strictly better convergence
+# than deterministic round for ternary weights (Zhao et al. NeurIPS 2024,
+# arXiv:2412.04787). Set False during eval/inference for determinism.
+STOCH_ROUND = tf.Variable(True, trainable=False, dtype=tf.bool,
+                           name="stoch_round")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1-BIT PRIMITIVES
@@ -161,10 +168,16 @@ class AbsMeanQuantizer(tf.keras.constraints.Constraint):
         abs_w = tf.abs(tf.reshape(w, [-1]))
         scale = tfp_median(abs_w) + self.eps
         w_scaled = w / scale
-        # Straight-through: round in forward, identity in backward
-        return w_scaled + tf.stop_gradient(
-            tf.clip_by_value(tf.round(w_scaled), -1.0, 1.0) - w_scaled
-        )
+        # Stochastic rounding (Zhao et al. NeurIPS 2024, arXiv:2412.04787):
+        # rounds up with probability = fractional part; deterministic otherwise.
+        def _stoch():
+            noise   = tf.random.uniform(tf.shape(w_scaled), -0.5, 0.5)
+            return tf.clip_by_value(tf.round(w_scaled + noise), -1.0, 1.0)
+        def _det():
+            return tf.clip_by_value(tf.round(w_scaled), -1.0, 1.0)
+        w_round = tf.cond(STOCH_ROUND, _stoch, _det)
+        # STE: round in forward, identity in backward
+        return w_scaled + tf.stop_gradient(w_round - w_scaled)
 
     def __call__(self, w):
         # Two-stage QAT: when QAT_ENABLED is False, behave as identity so
@@ -740,6 +753,7 @@ def main(args):
     # ── Stage 2: ternary QAT (resume from warmup_epochs, keep AdamW state) ──
     print(f"\n=== Stage 2: ternary QAT for epochs {warmup_epochs}–{EPOCHS} ===")
     QAT_ENABLED.assign(True)
+    STOCH_ROUND.assign((not args.baseline) and args.stoch_round)
     history_qat = model.fit(
         X, y,
         initial_epoch    = warmup_epochs,
@@ -750,6 +764,10 @@ def main(args):
         validation_split = 0.20,
         callbacks        = [early_stop],
     )
+
+    # Disable stochastic rounding for inference — weights stay ternary but
+    # eval passes are deterministic from here onward.
+    STOCH_ROUND.assign(False)
 
     # ── Stage 2.5: activation-QAT calibration (W1A8) ─────────────────────────
     # BitNet a4.8 (arXiv:2411.04965): turn on ACT_QAT_ENABLED for 5% of EPOCHS
@@ -974,6 +992,7 @@ def sanity_check(fp_edges=True):
     # BitLinear layers inside BitMHSA/BitFFN are reached (model.layers is
     # shallow — it only sees top-level layers in the functional graph).
     QAT_ENABLED.assign(True)
+    STOCH_ROUND.assign(False)    # deterministic for the check
     q = AbsMeanQuantizer()
     for sub in model.submodules:
         if isinstance(sub, BitLinear):
@@ -1083,6 +1102,13 @@ if __name__ == "__main__":
     parser.add_argument("--act-quant", dest="act_quant",
                         choices=["fp32", "int8"], default="int8",
                         help="Activation quantization for BitLinear (default: int8)")
+    # ── Step 5: stochastic rounding ───────────────────────────────────────────
+    # Zhao et al. NeurIPS 2024, arXiv:2412.04787
+    parser.add_argument("--stoch-round", dest="stoch_round",
+                        action="store_true", default=True,
+                        help="Stochastic rounding in ternary STE during training (default: on)")
+    parser.add_argument("--no-stoch-round", dest="stoch_round", action="store_false",
+                        help="Use deterministic rounding in ternary STE")
     # ── Positional data files ─────────────────────────────────────────────────
     parser.add_argument("SignalTrainFile",       nargs="?", type=str)
     parser.add_argument("BkgTrainFile",          nargs="?", type=str)
