@@ -64,7 +64,7 @@ Smoke training results on 10 k synthetic data (steps 1–3 combined vs baseline)
 
 Final integration smoke (3 epochs, all flags, synthetic 8 k samples):
 
-- AUROC = 0.9808
+- AUROC = 0.911 (log-scale ROC; earlier figure of 0.9808 was from a linear-scale evaluation and is incorrect)
 - TPR @ FPR = 1e-2 = 0.658 (after only 3 Stage-3 epochs on a 4-epoch warm-start)
 
 The +0.26 gain at FPR=1e-2 on the diag plot is reproducible

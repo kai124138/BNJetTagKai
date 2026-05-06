@@ -556,11 +556,17 @@ def pauc_loss_fn(y_true, y_logit, fpr_thresh=0.01):
     Yao, Lin, Yang (2022), arXiv:2203.01505. Equivalent to LibAUC pAUCLoss 1-way."""
     pos      = tf.boolean_mask(y_logit, tf.equal(y_true, 1.0))
     neg      = tf.boolean_mask(y_logit, tf.equal(y_true, 0.0))
-    K        = tf.maximum(1, tf.cast(
-                   tf.cast(tf.size(neg), tf.float32) * fpr_thresh, tf.int32))
-    hard_neg, _ = tf.math.top_k(neg, k=K)
-    diff     = tf.expand_dims(hard_neg, 0) - tf.expand_dims(pos, 1) + 1.0
-    return tf.reduce_mean(tf.square(tf.nn.relu(diff)))
+    def _compute():
+        K        = tf.maximum(1, tf.cast(
+                       tf.cast(tf.size(neg), tf.float32) * fpr_thresh, tf.int32))
+        hard_neg, _ = tf.math.top_k(neg, k=K)
+        diff     = tf.expand_dims(hard_neg, 0) - tf.expand_dims(pos, 1) + 1.0
+        return tf.reduce_mean(tf.square(tf.nn.relu(diff)))
+    return tf.cond(
+        tf.logical_or(tf.equal(tf.size(neg), 0), tf.equal(tf.size(pos), 0)),
+        lambda: tf.constant(0.0),
+        _compute,
+    )
 
 
 def pauc2way_loss_fn(y_true, y_logit, fpr_thresh=0.01, tpr_floor=0.80):
@@ -568,16 +574,22 @@ def pauc2way_loss_fn(y_true, y_logit, fpr_thresh=0.01, tpr_floor=0.80):
     Yang et al. TPAMI 2022, arXiv:2206.11655."""
     pos      = tf.boolean_mask(y_logit, tf.equal(y_true, 1.0))
     neg      = tf.boolean_mask(y_logit, tf.equal(y_true, 0.0))
-    K_neg    = tf.maximum(1, tf.cast(
-                   tf.cast(tf.size(neg), tf.float32) * fpr_thresh, tf.int32))
-    K_pos    = tf.maximum(1, tf.cast(
-                   tf.cast(tf.size(pos), tf.float32) * (1.0 - tpr_floor), tf.int32))
-    hard_neg, _ = tf.math.top_k(neg, k=K_neg)
-    # Bottom-K positives: negate, top-K, negate back
-    hard_pos, _ = tf.math.top_k(-pos, k=K_pos)
-    hard_pos    = -hard_pos
-    diff     = tf.expand_dims(hard_neg, 0) - tf.expand_dims(hard_pos, 1) + 1.0
-    return tf.reduce_mean(tf.square(tf.nn.relu(diff)))
+    def _compute():
+        K_neg    = tf.maximum(1, tf.cast(
+                       tf.cast(tf.size(neg), tf.float32) * fpr_thresh, tf.int32))
+        K_pos    = tf.maximum(1, tf.cast(
+                       tf.cast(tf.size(pos), tf.float32) * (1.0 - tpr_floor), tf.int32))
+        hard_neg, _ = tf.math.top_k(neg, k=K_neg)
+        # Bottom-K positives: negate, top-K, negate back
+        hard_pos, _ = tf.math.top_k(-pos, k=K_pos)
+        hard_pos    = -hard_pos
+        diff     = tf.expand_dims(hard_neg, 0) - tf.expand_dims(hard_pos, 1) + 1.0
+        return tf.reduce_mean(tf.square(tf.nn.relu(diff)))
+    return tf.cond(
+        tf.logical_or(tf.equal(tf.size(neg), 0), tf.equal(tf.size(pos), 0)),
+        lambda: tf.constant(0.0),
+        _compute,
+    )
 
 
 def _tpr_at_fpr(y_true, y_score, fpr_target):
@@ -961,9 +973,9 @@ def main(args):
             batch_losses = []
             for x_b, y_b, w_b in tr_ds_s2:
                 with tf.GradientTape() as tape:
-                    s_logit = model(x_b, training=True)           # (B,1) student
+                    s_logit = tf.squeeze(model(x_b, training=True), axis=-1)       # (B,)
                     t_logit = tf.stop_gradient(
-                        teacher(x_b, training=False))             # (B,1) teacher FP32
+                        tf.squeeze(teacher(x_b, training=False), axis=-1))         # (B,)
                     f_l = focal_fn_s2(y_b, s_logit)
                     # MSE of soft sigmoid outputs at temperature T
                     kd_l = tf.reduce_mean(tf.square(
@@ -977,7 +989,7 @@ def main(args):
                 batch_losses.append(float(loss))
 
             ep_loss = float(np.mean(batch_losses))
-            vl_logit = model(X_vl_s2, training=False)
+            vl_logit = tf.squeeze(model(X_vl_s2, training=False), axis=-1)
             vl_loss  = float(focal_fn_s2(y_vl_s2, vl_logit))
             train_loss_s2.append(ep_loss)
             val_loss_s2.append(vl_loss)
@@ -1058,6 +1070,10 @@ def main(args):
     plt.legend(loc="best")
     plt.tight_layout()
     plt.savefig(os.getcwd() + "/{}_bitnetLoss.pdf".format(tag), dpi=120)
+
+    # Save post-Stage-2.5 weights so a Stage-3 crash doesn't lose them
+    model.save(os.getcwd() + "/{}_bitnetJetTagModel_preS3.h5".format(tag))
+    print(f"Pre-Stage-3 model saved to {tag}_bitnetJetTagModel_preS3.h5")
 
     # ── Stage 3: AUC fine-tuning ──────────────────────────────────────────────
     # Three loss modes selected by --auc-loss:
