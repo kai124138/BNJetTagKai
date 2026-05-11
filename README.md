@@ -235,5 +235,5 @@ See `hls4ml/README.md` for more.
 - Ma et al., *The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits*
   (2024) — for the BitNet ternary quantization scheme.
 - [fastmachinelearning/hls4ml](https://github.com/fastmachinelearning/hls4ml)
-- Russell Dunn's L1JetTag dataset and the upstream BNJetTag project at
+- Russell's L1JetTag dataset and the upstream BNJetTag project at
   `Brainz22/BNJetTag`.
