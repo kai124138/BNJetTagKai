@@ -40,7 +40,7 @@ and it will actually be honored in the generated `defines.h`.
 You can verify the patch worked by checking the generated firmware:
 
 ```bash
-grep "_table_t" bitnet/hls4ml_deepsets_v2/firmware/defines.h
+grep "_table_t" models/hls4ml_deepsets_v2/firmware/defines.h
 # Expected: typedef ap_fixed<24,8> ds_block_1_norm1_table_t;
 #           (and similar for other LNs, matching what you configured)
 ```

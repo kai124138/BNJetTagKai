@@ -1,7 +1,8 @@
 # hls4ml Conversion for the DeepSets Jet Tagger
 
 This directory holds everything that converts the trained Keras DeepSets model
-(`bitnet/deepsets_clean.h5`) into HLS C++ for FPGA synthesis.
+(`models/deepsets_d64_l3_ffn128/deepsets_clean.h5`) into HLS C++ for FPGA
+synthesis.
 
 All scripts here are designed to be run **from the repository root**, e.g.:
 
@@ -10,20 +11,21 @@ cd ~/BNJetTagKai
 python hls4ml/hls_convert_v2.py
 ```
 
-(They reference paths like `bitnet/deepsets_clean.h5` relative to the repo root.)
+(They reference paths like `models/deepsets_d64_l3_ffn128/deepsets_clean.h5`
+relative to the repo root.)
 
 ## Files
 
 | Script               | What it does                                                    |
 | -------------------- | --------------------------------------------------------------- |
-| `hls_convert_v2.py`  | Main conversion. Produces `bitnet/hls4ml_deepsets_v2/`.         |
+| `hls_convert_v2.py`  | Main conversion. Produces `models/hls4ml_deepsets_v2/`.         |
 | `hls_trace.py`       | Layer-by-layer comparison: Keras vs HLS C-sim per layer output. |
 | `hls_debug.py`       | Sanity check with wide global precision (`ap_fixed<32,16>`).    |
 | `hls_build.py`       | Runs Vivado HLS synthesis (`hls_model.build()`) — long. ~30–60min on the target part. |
 
 ## Prerequisites
 
-1. Trained model exists at `bitnet/deepsets_clean.h5`.
+1. Trained model exists at `models/deepsets_d64_l3_ffn128/deepsets_clean.h5`.
 2. hls4ml is installed under `software/hls4ml/` (editable install).
 3. The **three source patches** in `patches/hls4ml/` have been applied to that
    local hls4ml clone — otherwise the LayerNorm output will be wrong. See

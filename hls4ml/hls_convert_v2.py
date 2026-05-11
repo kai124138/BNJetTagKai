@@ -13,8 +13,8 @@ import numpy as np
 import tensorflow as tf
 import hls4ml
 
-MODEL_PATH  = "bitnet/deepsets_clean.h5"
-HLS_DIR     = "bitnet/hls4ml_deepsets_v2"
+MODEL_PATH  = "models/deepsets_d64_l3_ffn128/deepsets_clean.h5"
+HLS_DIR     = "models/hls4ml_deepsets_v2"
 PART        = "xcvu9p-flgb2104-2L-e"
 CLOCK_NS    = 5
 

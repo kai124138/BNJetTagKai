@@ -44,7 +44,7 @@ its 2× amplification.
 
 ## Step 3 — Inspect generated firmware
 
-`bitnet/hls4ml_deepsets_v2/firmware/defines.h` showed:
+`models/hls4ml_deepsets_v2/firmware/defines.h` showed:
 
 ```cpp
 typedef ap_ufixed<8,5> input_norm_table_t;

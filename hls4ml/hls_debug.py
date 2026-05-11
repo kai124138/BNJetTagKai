@@ -10,8 +10,8 @@ import numpy as np
 import tensorflow as tf
 import hls4ml
 
-MODEL_PATH = "bitnet/deepsets_clean.h5"
-HLS_DIR    = "bitnet/hls4ml_deepsets_debug"
+MODEL_PATH = "models/deepsets_d64_l3_ffn128/deepsets_clean.h5"
+HLS_DIR    = "models/hls4ml_deepsets_debug"
 
 # ── Load model ──────────────────────────────────────────────────────────────
 print("Loading Keras model...")

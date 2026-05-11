@@ -84,7 +84,7 @@ in `initialize()`. After this, you can set `'table': 'ap_fixed<24,8>'` in the
 Precision dict and have it actually be respected. Verify with:
 
 ```bash
-grep "_table_t" bitnet/hls4ml_deepsets_v2/firmware/defines.h
+grep "_table_t" models/hls4ml_deepsets_v2/firmware/defines.h
 # Expected:
 #   typedef ap_fixed<16,6> input_norm_table_t;
 #   typedef ap_fixed<24,8> ds_block_1_norm1_table_t;

@@ -755,8 +755,8 @@ def sweep_mode(args):
     lr_grid       = [5e-5, 1e-4, 3e-4]
     wd_grid       = [1e-3, 1e-2, 5e-2]
 
-    os.makedirs("bitnet", exist_ok=True)
-    csv_path = "bitnet/sweep_results.csv"
+    os.makedirs("models", exist_ok=True)
+    csv_path = "models/sweep_results.csv"
     rows = []
 
     for lr in lr_grid:
@@ -851,26 +851,30 @@ def main(args):
         print("\nImpact parameter was not normalized beforehand.\n")
         norm_b4 = False
 
-    arch_prefix = "deepsets" if args.deepsets else "bitnet"
+    arch_prefix = "deepsets" if args.deepsets else "transformer"
     arch_suffix = f"_d{args.d_model}_l{args.n_layers}_ffn{args.ffn_dim}"
+    run_dir = f"models/{arch_prefix}_d{args.d_model}_l{args.n_layers}_ffn{args.ffn_dim}"
+    if (not args.deepsets) and (not args.baseline) and args.kd_weight > 0.0:
+        run_dir += "_kd"
+    file_prefix = "deepsets_" if args.deepsets else ""
     if norm_b4:
-        tag = f"bitnet/{arch_prefix}_train{arch_suffix}"
+        tag = f"{run_dir}/{file_prefix}train{arch_suffix}"
     elif normalizeIPs:
-        tag = f"bitnet/{arch_prefix}_Norm{arch_suffix}"
+        tag = f"{run_dir}/{file_prefix}Norm{arch_suffix}"
         scaler = MinMaxScaler(feature_range=(-1, 1))
         for feat_idx in [8, 9, 10]:
             tmp = scaler.fit_transform([[v] for v in X[:, :, feat_idx].ravel()])
             X[:, :, feat_idx] = tmp.reshape(X[:, :, feat_idx].shape)
     else:
-        tag = f"bitnet/{arch_prefix}_noNorm_train{arch_suffix}"
+        tag = f"{run_dir}/{file_prefix}noNorm_train{arch_suffix}"
 
     os.makedirs(os.path.dirname(os.getcwd() + f"/{tag}_model.png"),
                 exist_ok=True)
-    os.makedirs(os.getcwd() + "/v1/bitnet", exist_ok=True)
+    os.makedirs(os.getcwd() + "/legacy/v1/" + os.path.dirname(tag), exist_ok=True)
 
     #plot kinematics
     from util.plotting.kinematics_plotter import kinematics
-    kinematics(X, sampleData, y, "v1", tag)
+    kinematics(X, sampleData, y, "legacy/v1", tag)
 
     # ── pT-reweighting  (unchanged) ───────────────────────────────────────────
     thebins    = np.linspace(0, 500, 20)
@@ -1362,8 +1366,8 @@ def write_hls4ml_config(model, args, tag, act_bits=8, fp_edges=True):
     """
     import yaml
 
-    os.makedirs("bitnet", exist_ok=True)
-    cfg_path = f"bitnet/{tag.replace('/', '_')}_hls4ml_config.yaml"
+    cfg_path = f"{tag}_hls4ml_config.yaml"
+    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
 
     # Per-layer precision map
     # ternary W: ap_int<2> (values -1,0,+1 fit in 2 signed bits)
@@ -1583,7 +1587,7 @@ if __name__ == "__main__":
     parser.add_argument("--sanity", action="store_true",
                         help="Run shape/weight sanity check (no data needed)")
     parser.add_argument("--sweep", action="store_true",
-                        help="Run LR/WD grid sweep and write bitnet/sweep_results.csv")
+                        help="Run LR/WD grid sweep and write models/sweep_results.csv")
     parser.add_argument("--baseline", action="store_true",
                         help="Reproduce original behaviour byte-for-byte (disables all new features)")
     parser.add_argument("--deepsets", action="store_true",

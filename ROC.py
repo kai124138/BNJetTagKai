@@ -17,7 +17,10 @@ SIG_TEST = ("/home/users/russelld/L1JetTagDaniel/hls4mlModifications"
 QCD_TEST = ("/home/users/russelld/L1JetTagDaniel/hls4mlModifications"
             "/10-08-23/02-02_datasets/ReversedPhi_Eta/QCD"
             "/testingDatapt20_vDter_wEdits4ff.h5")
-BITNET_MODEL = "bitnet/noNorm_train_d64_l3_ffn128_bitnetJetTagModel.h5"
+BITNET_MODEL = (
+    "models/transformer_d64_l3_ffn128_kd/"
+    "noNorm_train_d64_l3_ffn128_bitnetJetTagModel.h5"
+)
 
 with h5py.File(SIG_TEST, "r") as hf:
     dataset = hf["Testing Data"][:]
@@ -98,4 +101,3 @@ plt.legend(loc="best")
 plt.xscale("log")
 plt.grid(True)
 plt.savefig("ROCCurve.png")
-

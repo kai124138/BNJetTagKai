@@ -4,9 +4,10 @@ __pycache__/
 *.pyo
 
 # HLS generated project directories (large, auto-generated)
-bitnet/hls4ml_deepsets_v2/
-bitnet/hls4ml_deepsets_prj/
-bitnet/hls4ml_deepsets_debug/
+models/hls4ml_deepsets_v2/
+models/hls4ml_deepsets_prj/
+models/hls4ml_deepsets_debug/
+models/hls4ml_deepsets_iostream/
 
 # hls4ml software installation (install separately)
 software/

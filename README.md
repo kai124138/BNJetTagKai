@@ -16,9 +16,9 @@ This is a fork of the original BNJetTag work, with two main additions:
    the same BitFFN + LayerNorm blocks plus `GlobalAveragePooling1D` over the
    particle dimension.
 
-The active work right now is in `hls4ml/` — converting `deepsets_clean.h5` to
-HLS C++ and getting bit-accurate C-simulation against Keras before running
-Vivado synthesis.
+The active work right now is in `hls4ml/` — converting
+`models/deepsets_d64_l3_ffn128/deepsets_clean.h5` to HLS C++ and getting
+bit-accurate C-simulation against Keras before running Vivado synthesis.
 
 ---
 
@@ -32,11 +32,11 @@ BNJetTagKai/
 ├── ROCCurve.png            Current best ROC plot
 ├── environment.yml         conda/micromamba environment
 │
-├── bitnet/                 Trained models and training artifacts
-│   ├── deepsets_clean.h5                        ← model going into hls4ml
-│   ├── bitnet_d64_l3.onnx                       ← ONNX export of transformer
-│   ├── deepsets_noNorm_train_d64_l3_ffn128_*    ← DeepSets training run outputs
-│   └── noNorm_train_d64_l3_ffn128_*             ← Transformer training run outputs
+├── models/                 Trained models and training artifacts by run
+│   ├── deepsets_d64_l3_ffn128/                  ← DeepSets run used by hls4ml
+│   │   └── deepsets_clean.h5                    ← model going into hls4ml
+│   └── transformer_d64_l3_ffn128_kd/            ← KD transformer run outputs
+│       └── bitnet_d64_l3.onnx                   ← ONNX export of transformer
 │
 ├── dataForgeScripts/       Jet reconstruction from CMS Ntuples
 │   ├── dataForge.py
@@ -103,8 +103,9 @@ After confirming that hls4ml has no support for `MultiHeadAttention`, a
 parallel architecture was added: the same BitFFN blocks (BitLinear →
 activation → BitLinear) wrapped around LayerNorm with residual connections,
 but with `GlobalAveragePooling1D` over the particle dimension instead of
-attention. This model is saved as `bitnet/deepsets_clean.h5` and is the one
-targeting FPGA synthesis.
+attention. This model is saved as
+`models/deepsets_d64_l3_ffn128/deepsets_clean.h5` and is the one targeting
+FPGA synthesis.
 
 ### 3. hls4ml conversion (in progress — accuracy debugging)
 

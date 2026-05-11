@@ -3,7 +3,7 @@ import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 import tensorflow as tf, numpy as np, hls4ml
 
-model = tf.keras.models.load_model('bitnet/deepsets_clean.h5', compile=False)
+model = tf.keras.models.load_model('models/deepsets_d64_l3_ffn128/deepsets_clean.h5', compile=False)
 rng = np.random.default_rng(42)
 X = rng.normal(0, 0.1, size=(8, 10, 14)).astype(np.float32)
 
