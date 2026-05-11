@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# HLS generated project directories (large, auto-generated)
+bitnet/hls4ml_deepsets_v2/
+bitnet/hls4ml_deepsets_prj/
+bitnet/hls4ml_deepsets_debug/
+
+# hls4ml software installation (install separately)
+software/
+
+# Claude Code internal
+.claude/
+
+# Logs
+*.log

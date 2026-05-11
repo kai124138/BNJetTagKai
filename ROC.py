@@ -9,28 +9,29 @@ import numpy as np
 matplotlib.use("Agg")
 import sys, os, numpy
 import tensorflow
-from qkeras.utils import load_qmodel
-# Establish the input and output data for each dataset, expanding dimensions for compatability with Conv1D layer input
+from qkerasModel import (AbsMeanQuantizer, BitLinear, RMSNorm,
+                         BitMHSA, BitFFN, BitTransformerBlock)
 
-# First Dataset
-#with h5py.File("/data/t3home000/aidandc/testingDataver3HH.h5", "r") as hf:
- #   dataset = hf["Testing Data"][:]
-    
-with h5py.File("data/testingDataSig.h5", "r") as hf:
+SIG_TEST = ("/home/users/russelld/L1JetTagDaniel/hls4mlModifications"
+            "/10-08-23/02-02_datasets/ReversedPhi_Eta/4c_4b_testData.h5")
+QCD_TEST = ("/home/users/russelld/L1JetTagDaniel/hls4mlModifications"
+            "/10-08-23/02-02_datasets/ReversedPhi_Eta/QCD"
+            "/testingDatapt20_vDter_wEdits4ff.h5")
+BITNET_MODEL = "bitnet/noNorm_train_d64_l3_ffn128_bitnetJetTagModel.h5"
+
+with h5py.File(SIG_TEST, "r") as hf:
     dataset = hf["Testing Data"][:]
-with h5py.File("data/testingDataQCD.h5", "r") as hf:
+with h5py.File(QCD_TEST, "r") as hf:
     datasetQCD = hf["Testing Data"][:]
-    
-dataset = np.concatenate((dataset,datasetQCD)) #Stacking datasets on top of another
-np.random.shuffle(dataset) #shuffling rows
-   
+
+dataset = np.concatenate((dataset, datasetQCD))
+np.random.shuffle(dataset)
 
 N_PART_PER_JET = 10
 N_FEAT = 14
-A = dataset[:, 0 : len(dataset[0]) - 1]
-b = dataset[:, len(dataset[0]) - 1]
-#A = expand_dims(A, axis=3)
-A = A.reshape((A.shape[0], N_PART_PER_JET, N_FEAT))
+# label is at column 140; particle features are columns 0-139
+A = dataset[:, 0:140].reshape(-1, N_PART_PER_JET, N_FEAT)
+b = dataset[:, 140]
 
 # Second Dataset
 #with h5py.File("/data/t3home000/aidandc/testingDataHHThreeV.h5", "r") as hf:
@@ -61,13 +62,22 @@ plt.figure(1)
 #model1 = load_model("modelOne.h5")
 #model2 = load_model("modelTwo.h5")
 #model3 = load_model("modelThree.h5")
-model1 = load_model("L1JetTagModel.h5")
+custom_objects = {
+    "AbsMeanQuantizer": AbsMeanQuantizer,
+    "BitLinear": BitLinear,
+    "RMSNorm": RMSNorm,
+    "BitMHSA": BitMHSA,
+    "BitFFN": BitFFN,
+    "BitTransformerBlock": BitTransformerBlock,
+}
+model1 = load_model(BITNET_MODEL, custom_objects=custom_objects, compile=False)
 
 # Creating ROC curves based on model predictions for each dataset
-Ab_pred_keras = model1.predict(A).ravel()
+import tensorflow as tf
+Ab_pred_keras = tf.sigmoid(model1.predict(A)).numpy().ravel()
 fpr_Ab, tpr_Ab, thresholds_Ab = roc_curve(b, Ab_pred_keras)
 auc_Ab = auc(fpr_Ab, tpr_Ab)
-plt.plot(fpr_Ab, tpr_Ab, label="Pf, AUC={:.3f}".format(auc_Ab))
+plt.plot(fpr_Ab, tpr_Ab, label="BitNet d64 l3, AUC={:.3f}".format(auc_Ab))
 
 #fpr_Bc, tpr_Bc, thresholds_Bc = roc_curve(b1, Bc_pred_keras)
 #auc_Bc = auc(fpr_Bc, tpr_Bc)
@@ -83,7 +93,7 @@ plt.xlabel("Background Efficiency", fontsize=16)
 plt.ylabel("Signal Efficiency", fontsize=16)
 #plt.axvline(x=0.01, ymin=0, ymax=0.59, color="red")
 #plt.axhline(y=0.6, xmin=0, xmax=0.573, color="red")
-plt.title("L1 LLP Tag Model ROC Curve", fontsize=16, weight="bold")
+plt.title("BitNet Jet Tagger ROC Curve", fontsize=16, weight="bold")
 plt.legend(loc="best")
 plt.xscale("log")
 plt.grid(True)
