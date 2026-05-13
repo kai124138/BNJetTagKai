@@ -807,6 +807,119 @@ def sweep_mode(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# WANDB SWEEP  (parallel agents via wandb.agent)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def wandb_sweep_mode(args):
+    """Run a W&B Bayesian sweep over LR/WD; spawn --num-agents parallel agents.
+
+    To parallelise across machines, initialise once (omit --sweep-id), note the
+    printed sweep ID, then re-run on each machine with --sweep-id <id>.
+
+    Ref: https://docs.wandb.ai/models/sweeps/parallelize-agents
+    """
+    import multiprocessing
+    import wandb
+
+    # ── Data loading (shared across all agents in this process group) ─────────
+    with h5py.File(args.SignalTrainFile,       "r") as hf:
+        dataset    = hf["Training Data"][:]
+    with h5py.File(args.BkgTrainFile,          "r") as hf:
+        datasetQCD = hf["Training Data"][:]
+    with h5py.File(args.sig_jetData_TrainFile, "r") as hf:
+        sampleData = hf["Sample Data"][:]
+    with h5py.File(args.bkg_jetData_TrainFile, "r") as hf:
+        sampleDataQCD = hf["Sample Data"][:]
+
+    dataset    = np.concatenate((dataset, datasetQCD))
+    sampleData = np.concatenate((sampleData, sampleDataQCD))
+    fullData   = np.concatenate((dataset, sampleData), axis=1)
+    np.random.shuffle(fullData)
+    dataset    = fullData[:, 0:141]
+    fullData_X = dataset[:, :-1].reshape(-1, N_PART_PER_JET, N_FEAT).astype(np.float32)
+    fullData_y = dataset[:, -1].astype(np.float32)
+
+    n_val  = int(0.20 * len(fullData_X))
+    X_tr   = fullData_X[:-n_val]
+    y_tr   = fullData_y[:-n_val]
+    X_vl   = fullData_X[-n_val:]
+    y_vl   = fullData_y[-n_val:]
+
+    # ── Sweep config ──────────────────────────────────────────────────────────
+    sweep_config = {
+        "method": "bayes",
+        "metric": {"name": "tpr_at_fpr_1e2", "goal": "maximize"},
+        "parameters": {
+            "lr": {"values": [5e-5, 1e-4, 3e-4]},
+            "wd": {"values": [1e-3, 1e-2, 5e-2]},
+        },
+    }
+
+    # ── Init or join sweep ────────────────────────────────────────────────────
+    if args.sweep_id:
+        sweep_id = args.sweep_id
+        print(f"Joining existing W&B sweep: {sweep_id}")
+    else:
+        sweep_id = wandb.sweep(sweep_config, project=args.wandb_project)
+        print(f"Initialised W&B sweep: {sweep_id}")
+        print(f"  → Run additional agents with: --sweep-id {sweep_id}")
+
+    # ── Per-run training function (called by wandb.agent) ─────────────────────
+    BATCH_SIZE_SW = 50
+    EPOCHS_SW     = max(1, int(0.10 * 200))
+
+    def train_run():
+        with wandb.init() as run:
+            cfg = run.config
+            lr  = cfg.lr
+            wd  = cfg.wd
+
+            QAT_ENABLED.assign(False)
+            m = build_bitnet_jet_tagger(
+                fp_edges = (not args.baseline) and args.fp_edges,
+                v_eps    = 1e-6 if args.baseline else args.qv_eps,
+            )
+            m.compile(
+                loss      = focal_loss(gamma=1.0, alpha=0.5),
+                optimizer = tf.keras.optimizers.experimental.AdamW(
+                    learning_rate=lr, weight_decay=wd, beta_2=0.95),
+                metrics   = ["binary_accuracy"],
+            )
+
+            s1_ep = max(1, EPOCHS_SW // 5)
+            m.fit(X_tr, y_tr, epochs=s1_ep, batch_size=BATCH_SIZE_SW,
+                  verbose=0, validation_split=0.10)
+            QAT_ENABLED.assign(True)
+            hist = m.fit(X_tr, y_tr, initial_epoch=s1_ep, epochs=EPOCHS_SW,
+                         batch_size=BATCH_SIZE_SW, verbose=0, validation_split=0.10)
+
+            vl_prob     = tf.sigmoid(m(X_vl, training=False)).numpy().ravel()
+            auroc       = float(roc_auc_score(y_vl, vl_prob))
+            tpr_1e2     = _tpr_at_fpr(y_vl, vl_prob, 1e-2)
+            tpr_1e3     = _tpr_at_fpr(y_vl, vl_prob, 1e-3)
+            final_vloss = float(hist.history["val_loss"][-1])
+
+            wandb.log({
+                "auroc":          auroc,
+                "tpr_at_fpr_1e2": tpr_1e2,
+                "tpr_at_fpr_1e3": tpr_1e3,
+                "final_val_loss": final_vloss,
+            })
+
+    # ── Launch parallel agents ────────────────────────────────────────────────
+    def _agent_worker(_):
+        wandb.agent(sweep_id, function=train_run,
+                    project=args.wandb_project, count=args.sweep_count)
+
+    n_agents = args.num_agents
+    if n_agents == 1:
+        _agent_worker(0)
+    else:
+        with multiprocessing.Pool(processes=n_agents) as pool:
+            pool.map(_agent_worker, range(n_agents))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRAINING SCRIPT  (mirrors your original train.py exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1588,6 +1701,18 @@ if __name__ == "__main__":
                         help="Run shape/weight sanity check (no data needed)")
     parser.add_argument("--sweep", action="store_true",
                         help="Run LR/WD grid sweep and write models/sweep_results.csv")
+    parser.add_argument("--wandb-sweep", dest="wandb_sweep", action="store_true",
+                        help="Run LR/WD sweep via W&B (Bayesian, parallel agents)")
+    parser.add_argument("--wandb-project", dest="wandb_project",
+                        default="bnjettagkai-sweep",
+                        help="W&B project name for --wandb-sweep (default: bnjettagkai-sweep)")
+    parser.add_argument("--sweep-id", dest="sweep_id", default=None,
+                        help="Join an existing W&B sweep ID instead of creating one "
+                             "(use for multi-machine parallelism)")
+    parser.add_argument("--num-agents", dest="num_agents", type=int, default=1,
+                        help="Number of parallel W&B agents to spawn locally (default: 1)")
+    parser.add_argument("--sweep-count", dest="sweep_count", type=int, default=None,
+                        help="Max runs per agent; None = run until sweep is done")
     parser.add_argument("--baseline", action="store_true",
                         help="Reproduce original behaviour byte-for-byte (disables all new features)")
     parser.add_argument("--deepsets", action="store_true",
@@ -1683,6 +1808,11 @@ if __name__ == "__main__":
                     args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
             parser.error("Provide all four data file arguments for --sweep")
         sweep_mode(args)
+    elif args.wandb_sweep:
+        if not all([args.SignalTrainFile, args.BkgTrainFile,
+                    args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
+            parser.error("Provide all four data file arguments for --wandb-sweep")
+        wandb_sweep_mode(args)
     else:
         if not all([args.SignalTrainFile, args.BkgTrainFile,
                     args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
