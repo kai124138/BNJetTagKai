@@ -143,6 +143,38 @@ STOCH_ROUND = tf.Variable(True, trainable=False, dtype=tf.bool,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# W&B EPOCH LOGGER  (used by Stage 1 / 2.5 model.fit callbacks)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WandbEpochLogger(tf.keras.callbacks.Callback):
+    """Log per-epoch Keras metrics to W&B with a continuous global step.
+
+    Args:
+        stage_offset: Added to the Keras epoch counter so the W&B x-axis is
+                      continuous across stages (pass warmup_epochs for Stage 2,
+                      EPOCHS for Stage 2.5, etc.).
+        prefix:       Metric key prefix, e.g. "stage1" → "stage1/loss".
+    """
+
+    def __init__(self, stage_offset: int = 0, prefix: str = "stage"):
+        super().__init__()
+        self.stage_offset = stage_offset
+        self.prefix = prefix
+
+    def on_epoch_end(self, epoch, logs=None):
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        step = self.stage_offset + epoch
+        payload = {f"{self.prefix}/{k}": v for k, v in (logs or {}).items()}
+        payload["epoch"] = step
+        wandb.log(payload, step=step)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 1-BIT PRIMITIVES
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -751,7 +783,7 @@ def sweep_mode(args):
     y_vl    = fullData_y[-n_val:]
 
     BATCH_SIZE_SW = 50
-    EPOCHS_SW     = max(1, int(0.10 * 200))   # 10% of 200 = 20 epochs per config
+    EPOCHS_SW     = args.epochs_sw          # default 5 for quick CPU testing
     lr_grid       = [5e-5, 1e-4, 3e-4]
     wd_grid       = [1e-3, 1e-2, 5e-2]
 
@@ -807,21 +839,18 @@ def sweep_mode(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WANDB SWEEP  (parallel agents via wandb.agent)
+# WANDB SWEEP  (parallel agents via subprocess.Popen — TF-safe)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def wandb_sweep_mode(args):
-    """Run a W&B Bayesian sweep over LR/WD; spawn --num-agents parallel agents.
+def _run_single_agent(args):
+    """Single wandb.agent worker — runs inside each spawned subprocess.
 
-    To parallelise across machines, initialise once (omit --sweep-id), note the
-    printed sweep ID, then re-run on each machine with --sweep-id <id>.
-
-    Ref: https://docs.wandb.ai/models/sweeps/parallelize-agents
+    Each subprocess loads data independently so TF graphs are never forked.
+    Reads lr/wd from wandb.config on each run; logs 4 metrics back to W&B.
     """
-    import multiprocessing
     import wandb
 
-    # ── Data loading (shared across all agents in this process group) ─────────
+    # ── Load data ─────────────────────────────────────────────────────────────
     with h5py.File(args.SignalTrainFile,       "r") as hf:
         dataset    = hf["Training Data"][:]
     with h5py.File(args.BkgTrainFile,          "r") as hf:
@@ -845,28 +874,8 @@ def wandb_sweep_mode(args):
     X_vl   = fullData_X[-n_val:]
     y_vl   = fullData_y[-n_val:]
 
-    # ── Sweep config ──────────────────────────────────────────────────────────
-    sweep_config = {
-        "method": "bayes",
-        "metric": {"name": "tpr_at_fpr_1e2", "goal": "maximize"},
-        "parameters": {
-            "lr": {"values": [5e-5, 1e-4, 3e-4]},
-            "wd": {"values": [1e-3, 1e-2, 5e-2]},
-        },
-    }
-
-    # ── Init or join sweep ────────────────────────────────────────────────────
-    if args.sweep_id:
-        sweep_id = args.sweep_id
-        print(f"Joining existing W&B sweep: {sweep_id}")
-    else:
-        sweep_id = wandb.sweep(sweep_config, project=args.wandb_project)
-        print(f"Initialised W&B sweep: {sweep_id}")
-        print(f"  → Run additional agents with: --sweep-id {sweep_id}")
-
-    # ── Per-run training function (called by wandb.agent) ─────────────────────
     BATCH_SIZE_SW = 50
-    EPOCHS_SW     = max(1, int(0.10 * 200))
+    EPOCHS_SW     = args.epochs_sw
 
     def train_run():
         with wandb.init() as run:
@@ -905,18 +914,111 @@ def wandb_sweep_mode(args):
                 "tpr_at_fpr_1e3": tpr_1e3,
                 "final_val_loss": final_vloss,
             })
+            print(f"  run done  lr={lr:.0e}  wd={wd:.0e}"
+                  f"  AUROC={auroc:.4f}  TPR@1e-2={tpr_1e2:.4f}")
 
-    # ── Launch parallel agents ────────────────────────────────────────────────
-    def _agent_worker(_):
-        wandb.agent(sweep_id, function=train_run,
-                    project=args.wandb_project, count=args.sweep_count)
+    wandb.agent(args.sweep_id, function=train_run,
+                project=args.wandb_project, count=args.sweep_count)
 
-    n_agents = args.num_agents
-    if n_agents == 1:
-        _agent_worker(0)
+
+def wandb_sweep_mode(args):
+    """Orchestrate a W&B Bayesian sweep with parallel subprocess agents.
+
+    Parent path  (num_agents > 1, or no sweep_id yet):
+      1. Validate data paths.
+      2. Create sweep (or join existing via --sweep-id).
+      3. Spawn N child subprocesses each targeting that sweep.
+      4. Wait for all children.
+
+    Child path  (sweep_id set AND num_agents == 1):
+      Calls _run_single_agent() directly — no further forking.
+
+    This split avoids forking TensorFlow/CUDA contexts, which corrupts GPU
+    memory and causes silent graph errors with multiprocessing.Pool.
+
+    Multi-machine parallelism:
+      Run once without --sweep-id → note the printed ID.
+      Re-run on each machine with --sweep-id <id> --num-agents <N>.
+
+    Ref: https://docs.wandb.ai/models/sweeps/parallelize-agents
+    """
+    import subprocess
+    import sys
+    import wandb
+
+    # ── Child process path: run a single agent directly ───────────────────────
+    if args.sweep_id and args.num_agents == 1:
+        _run_single_agent(args)
+        return
+
+    # ── Parent path: validate data, create sweep, spawn children ─────────────
+    for attr in ("SignalTrainFile", "BkgTrainFile",
+                 "sig_jetData_TrainFile", "bkg_jetData_TrainFile"):
+        path = getattr(args, attr)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Data file not found: {path}")
+
+    sweep_config = {
+        "method":  "bayes",
+        "metric":  {"name": "tpr_at_fpr_1e2", "goal": "maximize"},
+        "run_cap": args.max_runs,
+        "parameters": {
+            "lr": {"values": [5e-5, 1e-4, 3e-4]},
+            "wd": {"values": [1e-3, 1e-2, 5e-2]},
+        },
+    }
+
+    if args.sweep_id:
+        sweep_id = args.sweep_id
+        print(f"Joining existing W&B sweep: {sweep_id}")
     else:
-        with multiprocessing.Pool(processes=n_agents) as pool:
-            pool.map(_agent_worker, range(n_agents))
+        sweep_id = wandb.sweep(sweep_config, project=args.wandb_project)
+        print(f"Initialised W&B sweep: {sweep_id}")
+        print(f"  Re-run on another machine with: --wandb-sweep --sweep-id {sweep_id}")
+
+    # ── Build base command forwarding all relevant flags to children ──────────
+    base_cmd = [
+        sys.executable, os.path.abspath(__file__),
+        "--wandb-sweep",
+        "--sweep-id",      sweep_id,
+        "--wandb-project", args.wandb_project,
+        "--num-agents",    "1",
+        "--sweep-count",   str(args.sweep_count) if args.sweep_count else "1",
+        "--epochs-sw",     str(args.epochs_sw),
+        "--d_model",       str(args.d_model),
+        "--n_layers",      str(args.n_layers),
+        "--ffn_dim",       str(args.ffn_dim),
+        "--kd-weight",     str(args.kd_weight),
+        "--qv-eps",        str(args.qv_eps),
+        "--act-quant",     args.act_quant,
+        "--auc-loss",      args.auc_loss,
+        # Positional data files
+        args.SignalTrainFile,
+        args.BkgTrainFile,
+        args.sig_jetData_TrainFile,
+        args.bkg_jetData_TrainFile,
+    ]
+    # Boolean flags with explicit on/off forms
+    base_cmd += ["--fp-edges"    if args.fp_edges    else "--no-fp-edges"]
+    base_cmd += ["--stoch-round" if args.stoch_round else "--no-stoch-round"]
+    base_cmd += ["--baseline"] if args.baseline else []
+
+    # ── Spawn N subprocesses ──────────────────────────────────────────────────
+    n_agents = args.num_agents
+    procs = []
+    for i in range(n_agents):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(i % max(1, n_agents))
+        print(f"Spawning agent {i}  (CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
+        procs.append(subprocess.Popen(base_cmd, env=env))
+
+    # ── Wait for all agents ───────────────────────────────────────────────────
+    for i, p in enumerate(procs):
+        rc = p.wait()
+        if rc != 0:
+            print(f"[WARNING] Agent {i} exited with code {rc}")
+
+    print(f"\nAll {n_agents} agent(s) finished for sweep {sweep_id}.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -984,6 +1086,40 @@ def main(args):
     os.makedirs(os.path.dirname(os.getcwd() + f"/{tag}_model.png"),
                 exist_ok=True)
     os.makedirs(os.getcwd() + "/legacy/v1/" + os.path.dirname(tag), exist_ok=True)
+
+    # ── W&B run initialisation (optional, enabled by --wandb) ────────────────
+    if args.wandb:
+        import wandb as _wandb
+        _wandb.init(
+            project = args.wandb_project,
+            name    = tag.replace("/", "_"),
+            tags    = ["main-training"],
+            config  = {
+                "d_model":       args.d_model,
+                "n_layers":      args.n_layers,
+                "ffn_dim":       args.ffn_dim,
+                "deepsets":      args.deepsets,
+                "fp_edges":      args.fp_edges,
+                "act_quant":     args.act_quant,
+                "qv_eps":        args.qv_eps,
+                "stoch_round":   args.stoch_round,
+                "epochs":        200,
+                "batch_size":    50,
+                "peak_lr":       3e-4,
+                "weight_decay":  0.01,
+                "kd_weight":     args.kd_weight,
+                "kd_temp":       args.kd_temp,
+                "auc_loss":      args.auc_loss,
+                "fpr_thresh":    args.fpr_thresh,
+                "tpr_floor":     args.tpr_floor,
+                "focal_weight":  args.focal_weight,
+                "pauc_weight":   args.pauc_weight,
+                "stratify":      args.stratify,
+                "reshape":       args.reshape,
+                "baseline":      args.baseline,
+                "run_tag":       tag,
+            },
+        )
 
     #plot kinematics
     from util.plotting.kinematics_plotter import kinematics
@@ -1102,6 +1238,7 @@ def main(args):
     # ── Stage 1: FP32 warm-start (no early stopping — let it run full 20%) ──
     print(f"\n=== Stage 1: FP32 warm-start for {warmup_epochs} epochs ===")
     QAT_ENABLED.assign(False)
+    _s1_cbs = [WandbEpochLogger(stage_offset=0, prefix="stage1")] if args.wandb else []
     history_fp32 = model.fit(
         X, y,
         epochs           = warmup_epochs,
@@ -1109,7 +1246,7 @@ def main(args):
         verbose          = 2,
         sample_weight    = np.asarray(weights),
         validation_split = 0.20,
-        callbacks        = [],
+        callbacks        = _s1_cbs,
     )
 
     # ── Stage 2: ternary QAT (resume from warmup_epochs, keep AdamW state) ──
@@ -1198,6 +1335,10 @@ def main(args):
             val_loss_s2.append(vl_loss)
             print(f"  ep {epoch+1:3d}/{EPOCHS}  "
                   f"loss={ep_loss:.4f}  val_loss={vl_loss:.4f}")
+            if args.wandb:
+                import wandb as _wandb
+                _wandb.log({"stage2/loss": ep_loss, "stage2/val_loss": vl_loss,
+                            "epoch": epoch}, step=epoch)
 
             # Manual early stopping on val_loss (patience = pat)
             if vl_loss < best_vloss:
@@ -1211,6 +1352,9 @@ def main(args):
         del teacher   # free memory before Stage 2.5
 
     else:
+        _s2_cbs = [early_stop]
+        if args.wandb:
+            _s2_cbs.append(WandbEpochLogger(stage_offset=warmup_epochs, prefix="stage2"))
         history_qat = model.fit(
             X, y,
             initial_epoch    = warmup_epochs,
@@ -1219,7 +1363,7 @@ def main(args):
             verbose          = 2,
             sample_weight    = np.asarray(weights),
             validation_split = 0.20,
-            callbacks        = [early_stop],
+            callbacks        = _s2_cbs,
         )
         train_loss_s2 = history_qat.history["loss"]
         val_loss_s2   = history_qat.history["val_loss"]
@@ -1246,6 +1390,10 @@ def main(args):
             ),
             metrics   = ["binary_accuracy"],
         )
+        _s25_cbs = (
+            [WandbEpochLogger(stage_offset=EPOCHS, prefix="stage25")]
+            if args.wandb else []
+        )
         model.fit(
             X, y,
             initial_epoch    = EPOCHS,
@@ -1254,7 +1402,7 @@ def main(args):
             verbose          = 2,
             sample_weight    = np.asarray(weights),
             validation_split = 0.20,
-            callbacks        = [],
+            callbacks        = _s25_cbs,
         )
     else:
         ACT_QAT_ENABLED.assign(False)
@@ -1431,6 +1579,22 @@ def main(args):
         print(f"  ep {epoch+1:2d}/{AUC_EPOCHS}  "
               f"train_AUC={tr_auc:.4f}  val_AUC={vl_auc:.4f}  "
               f"TPR@1e-2={vl_tpr1e2:.4f}  TPR@1e-3={vl_tpr1e3:.4f}{extra}")
+        if args.wandb:
+            import wandb as _wandb
+            _s3_base = EPOCHS + (act_epochs if do_act_quant else 0)
+            _s3_step = _s3_base + epoch
+            _s3_log = {
+                "stage3/train_auc":      tr_auc,
+                "stage3/val_auc":        vl_auc,
+                "stage3/tpr_at_fpr_1e2": vl_tpr1e2,
+                "stage3/tpr_at_fpr_1e3": vl_tpr1e3,
+                "epoch": _s3_step,
+            }
+            if auc_loss_mode == "aucm":
+                _s3_log["stage3/auc_a"]     = float(a_var.numpy())
+                _s3_log["stage3/auc_b"]     = float(b_var.numpy())
+                _s3_log["stage3/auc_alpha"] = float(alpha_var.numpy())
+            _wandb.log(_s3_log, step=_s3_step)
 
         # Update reshape weights for next epoch
         if do_reshape:
@@ -1449,6 +1613,16 @@ def main(args):
     plt.savefig(os.getcwd() + f"/{tag}_auc_finetune.pdf", dpi=120)
     print(f"\nStage-3 final val AUC: {vl_auc:.4f}  "
           f"TPR@FPR=1e-2: {vl_tpr1e2:.4f}  TPR@FPR=1e-3: {vl_tpr1e3:.4f}")
+
+    # ── W&B final metrics + finish ────────────────────────────────────────────
+    if args.wandb:
+        import wandb as _wandb
+        _wandb.log({
+            "final/val_auc":        vl_auc,
+            "final/tpr_at_fpr_1e2": vl_tpr1e2,
+            "final/tpr_at_fpr_1e3": vl_tpr1e3,
+        })
+        _wandb.finish()
 
     # ── Save  ─────────────────────────────────────────────────────────────────
     # model = tfmot.sparsity.keras.strip_pruning(model)  # ← re-enable if pruning
@@ -1695,126 +1869,140 @@ def sanity_check(fp_edges=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="BN 1-bit Transformer jet tagger for CMS L1 trigger"
+        description="BN 1-bit Transformer jet tagger for CMS L1 trigger",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python qkerasModel.py --sanity\n"
+            "  python qkerasModel.py sig.h5 bkg.h5 sigJet.h5 bkgJet.h5\n"
+            "  python qkerasModel.py --wandb sig.h5 bkg.h5 sigJet.h5 bkgJet.h5\n"
+            "  python qkerasModel.py --wandb-sweep --num-agents 4 --epochs-sw 5 \\\n"
+            "      sig.h5 bkg.h5 sigJet.h5 bkgJet.h5\n"
+            "  python qkerasModel.py --wandb-sweep --sweep-id abc123 --num-agents 2 \\\n"
+            "      sig.h5 bkg.h5 sigJet.h5 bkgJet.h5  # join existing sweep\n"
+        ),
     )
-    parser.add_argument("--sanity", action="store_true",
-                        help="Run shape/weight sanity check (no data needed)")
-    parser.add_argument("--sweep", action="store_true",
-                        help="Run LR/WD grid sweep and write models/sweep_results.csv")
-    parser.add_argument("--wandb-sweep", dest="wandb_sweep", action="store_true",
-                        help="Run LR/WD sweep via W&B (Bayesian, parallel agents)")
-    parser.add_argument("--wandb-project", dest="wandb_project",
-                        default="bnjettagkai-sweep",
-                        help="W&B project name for --wandb-sweep (default: bnjettagkai-sweep)")
-    parser.add_argument("--sweep-id", dest="sweep_id", default=None,
-                        help="Join an existing W&B sweep ID instead of creating one "
-                             "(use for multi-machine parallelism)")
-    parser.add_argument("--num-agents", dest="num_agents", type=int, default=1,
-                        help="Number of parallel W&B agents to spawn locally (default: 1)")
-    parser.add_argument("--sweep-count", dest="sweep_count", type=int, default=None,
-                        help="Max runs per agent; None = run until sweep is done")
-    parser.add_argument("--baseline", action="store_true",
-                        help="Reproduce original behaviour byte-for-byte (disables all new features)")
-    parser.add_argument("--deepsets", action="store_true",
-                        help="Use attention-free Deep Sets architecture (hls4ml-compatible)")
-    # ── Architecture flags ────────────────────────────────────────────────────
-    parser.add_argument("--d_model",  type=int, default=D_MODEL,
-                        help=f"Embedding dimension (default {D_MODEL})")
-    parser.add_argument("--n_layers", type=int, default=N_LAYERS,
-                        help=f"Number of transformer blocks (default {N_LAYERS})")
-    parser.add_argument("--ffn_dim",  type=int, default=FFN_DIM,
-                        help=f"FFN hidden dimension (default {FFN_DIM})")
-    # ── Step 1: FP edge layers ────────────────────────────────────────────────
-    # BitNet b1.58 (arXiv:2402.17764): input_proj and head_fc2 in FP32
-    parser.add_argument("--fp-edges", dest="fp_edges",
-                        action="store_true", default=True,
-                        help="Keep input_proj and head_fc2 in FP32 (default: on)")
-    parser.add_argument("--no-fp-edges", dest="fp_edges", action="store_false",
-                        help="Use ternary BitLinear for input_proj and head_fc2")
-    # ── Step 2: pAUC loss ────────────────────────────────────────────────────
-    # One-way pAUC (arXiv:2203.01505); two-way (arXiv:2206.11655)
-    parser.add_argument("--auc-loss", dest="auc_loss",
-                        choices=["aucm", "pauc1way", "pauc2way"],
-                        default="pauc1way",
-                        help="Stage-3 loss: aucm | pauc1way | pauc2way (default: pauc1way)")
-    parser.add_argument("--fpr-thresh", dest="fpr_thresh", type=float, default=0.01,
-                        help="FPR threshold for pAUC loss (default: 0.01)")
-    parser.add_argument("--tpr-floor", dest="tpr_floor", type=float, default=0.80,
-                        help="TPR floor for two-way pAUC loss (default: 0.80)")
-    # ── Step 3: composite loss + stratified sampling ──────────────────────────
-    # Benchmarking Deep AUROC (Zhu/Wu/Yang 2022, arXiv:2203.14177)
-    parser.add_argument("--focal-weight", dest="focal_weight", type=float, default=0.3,
-                        help="Focal component weight in composite Stage-3 loss (default: 0.3)")
-    parser.add_argument("--pauc-weight", dest="pauc_weight", type=float, default=0.7,
-                        help="pAUC component weight in composite Stage-3 loss (default: 0.7)")
-    parser.add_argument("--stratify", dest="stratify",
-                        action="store_true", default=True,
-                        help="Use stratified 50/50 batches in Stage 3 (default: on)")
-    parser.add_argument("--no-stratify", dest="stratify", action="store_false",
-                        help="Disable stratified batching in Stage 3")
-    # ── Step 4: activation quantization ──────────────────────────────────────
-    # BitNet a4.8 (arXiv:2411.04965): W1A8 per-token absmax int8 activations
-    parser.add_argument("--act-quant", dest="act_quant",
-                        choices=["fp32", "int8"], default="int8",
-                        help="Activation quantization for BitLinear (default: int8)")
-    # ── Step 5: stochastic rounding ───────────────────────────────────────────
-    # Zhao et al. NeurIPS 2024, arXiv:2412.04787
-    parser.add_argument("--stoch-round", dest="stoch_round",
-                        action="store_true", default=True,
-                        help="Stochastic rounding in ternary STE during training (default: on)")
-    parser.add_argument("--no-stoch-round", dest="stoch_round", action="store_false",
-                        help="Use deterministic rounding in ternary STE")
-    # ── Step 6: AUCReshaping callback ─────────────────────────────────────────
-    # Panambur et al. (2023), DOI 10.1038/s41598-023-48482-x
-    parser.add_argument("--reshape", dest="reshape",
-                        action="store_true", default=True,
-                        help="Enable AUCReshaping per-epoch positive reweighting (default: on)")
-    parser.add_argument("--no-reshape", dest="reshape", action="store_false",
-                        help="Disable AUCReshaping callback")
-    parser.add_argument("--reshape-boost", dest="reshape_boost", type=float, default=2.0,
-                        help="Weight multiplier for false-negative positives (default: 2.0)")
-    parser.add_argument("--reshape-cap", dest="reshape_cap", type=float, default=8.0,
-                        help="Maximum cumulative boost per sample (default: 8.0)")
-    # ── Step 10: Quantization Variation (Huang et al. arXiv:2307.00331) ──────
-    parser.add_argument("--qv-eps", dest="qv_eps", type=float, default=2e-6,
-                        help="Absmedian eps for Value projection in BitMHSA; "
-                             "Q/K use 1e-6 (default: 2e-6, arXiv:2307.00331)")
-    # ── Step 10: Stage-2 Knowledge Distillation ───────────────────────────────
-    # Teacher = frozen FP32 Stage-1 model; student minimises focal + KD MSE.
-    # Huang et al. (2023, arXiv:2307.00331).
-    parser.add_argument("--kd-weight", dest="kd_weight", type=float, default=0.3,
-                        help="Weight for KD MSE loss in Stage 2 (default: 0.3; 0 to disable)")
-    parser.add_argument("--no-kd", dest="kd_weight", action="store_const", const=0.0,
-                        help="Disable Stage-2 knowledge distillation")
-    parser.add_argument("--kd-temp", dest="kd_temp", type=float, default=2.0,
-                        help="Temperature for KD soft targets (default: 2.0)")
-    # ── Step 11: HLS4ML export ────────────────────────────────────────────────
-    parser.add_argument("--export-hls", dest="export_hls", action="store_true",
-                        default=False,
-                        help="After training, write hls4ml YAML config + resource estimate")
-    # ── Positional data files ─────────────────────────────────────────────────
-    parser.add_argument("SignalTrainFile",       nargs="?", type=str)
-    parser.add_argument("BkgTrainFile",          nargs="?", type=str)
-    parser.add_argument("sig_jetData_TrainFile", nargs="?", type=str)
-    parser.add_argument("bkg_jetData_TrainFile", nargs="?", type=str)
+
+    # ── Mode flags ────────────────────────────────────────────────────────────
+    mode = parser.add_argument_group("Mode flags")
+    mode.add_argument("--sanity",      action="store_true",
+                      help="Run shape/weight sanity check (no data needed)")
+    mode.add_argument("--sweep",       action="store_true",
+                      help="Run sequential LR/WD CSV grid → models/sweep_results.csv")
+    mode.add_argument("--wandb-sweep", dest="wandb_sweep", action="store_true",
+                      help="Run Bayesian LR/WD sweep via W&B with parallel agents")
+    mode.add_argument("--wandb",       action="store_true",
+                      help="Enable W&B tracking in the main training loop")
+
+    # ── W&B / sweep options ───────────────────────────────────────────────────
+    wb = parser.add_argument_group("W&B / sweep options")
+    wb.add_argument("--wandb-project", dest="wandb_project",
+                    default="bnjettagkai-sweep",
+                    help="W&B project name (default: bnjettagkai-sweep)")
+    wb.add_argument("--sweep-id", dest="sweep_id", default=None,
+                    help="Join an existing W&B sweep ID (multi-machine parallelism)")
+    wb.add_argument("--num-agents", dest="num_agents", type=int, default=1,
+                    help="Parallel agent subprocesses to spawn locally (default: 1)")
+    wb.add_argument("--sweep-count", dest="sweep_count", type=int, default=None,
+                    help="Max runs per agent; None = run until sweep is done")
+    wb.add_argument("--max-runs", dest="max_runs", type=int, default=20,
+                    help="Total sweep run budget / run_cap (default: 20)")
+    wb.add_argument("--epochs-sw", dest="epochs_sw", type=int, default=5,
+                    help="Epochs per sweep run — keep low for quick CPU testing (default: 5)")
+
+    # ── Architecture ──────────────────────────────────────────────────────────
+    arch = parser.add_argument_group("Architecture")
+    arch.add_argument("--d_model",  type=int, default=D_MODEL,
+                      help=f"Embedding dimension (default {D_MODEL})")
+    arch.add_argument("--n_layers", type=int, default=N_LAYERS,
+                      help=f"Transformer blocks (default {N_LAYERS})")
+    arch.add_argument("--ffn_dim",  type=int, default=FFN_DIM,
+                      help=f"FFN hidden dimension (default {FFN_DIM})")
+
+    # ── Training ──────────────────────────────────────────────────────────────
+    train = parser.add_argument_group("Training")
+    train.add_argument("--baseline",    action="store_true",
+                       help="Reproduce original byte-for-byte (disables all new features)")
+    train.add_argument("--deepsets",    action="store_true",
+                       help="Use attention-free Deep Sets architecture (hls4ml-compatible)")
+    train.add_argument("--fp-edges",    dest="fp_edges",
+                       action="store_true", default=True,
+                       help="Keep input_proj & head_fc2 in FP32 (default: on)")
+    train.add_argument("--no-fp-edges", dest="fp_edges", action="store_false",
+                       help="Use ternary BitLinear for edge layers")
+    train.add_argument("--act-quant",   dest="act_quant",
+                       choices=["fp32", "int8"], default="int8",
+                       help="Activation quantization: fp32 | int8 (default: int8)")
+    train.add_argument("--stoch-round",    dest="stoch_round",
+                       action="store_true", default=True,
+                       help="Stochastic rounding in ternary STE (default: on)")
+    train.add_argument("--no-stoch-round", dest="stoch_round", action="store_false",
+                       help="Disable stochastic rounding")
+    train.add_argument("--kd-weight",   dest="kd_weight", type=float, default=0.3,
+                       help="Stage-2 KD MSE loss weight (default: 0.3; 0 to disable)")
+    train.add_argument("--no-kd",       dest="kd_weight", action="store_const", const=0.0,
+                       help="Disable Stage-2 knowledge distillation")
+    train.add_argument("--kd-temp",     dest="kd_temp", type=float, default=2.0,
+                       help="KD soft-target temperature (default: 2.0)")
+    train.add_argument("--export-hls",  dest="export_hls", action="store_true", default=False,
+                       help="Write hls4ml YAML config + resource estimate after training")
+
+    # ── Loss & AUC fine-tuning ────────────────────────────────────────────────
+    loss = parser.add_argument_group("Loss & AUC fine-tuning")
+    loss.add_argument("--auc-loss",     dest="auc_loss",
+                      choices=["aucm", "pauc1way", "pauc2way"], default="pauc1way",
+                      help="Stage-3 loss: aucm | pauc1way | pauc2way (default: pauc1way)")
+    loss.add_argument("--fpr-thresh",   dest="fpr_thresh", type=float, default=0.01,
+                      help="FPR threshold for pAUC loss (default: 0.01)")
+    loss.add_argument("--tpr-floor",    dest="tpr_floor",  type=float, default=0.80,
+                      help="TPR floor for two-way pAUC (default: 0.80)")
+    loss.add_argument("--focal-weight", dest="focal_weight", type=float, default=0.3,
+                      help="Focal weight in composite Stage-3 loss (default: 0.3)")
+    loss.add_argument("--pauc-weight",  dest="pauc_weight",  type=float, default=0.7,
+                      help="pAUC weight in composite Stage-3 loss (default: 0.7)")
+    loss.add_argument("--stratify",    dest="stratify", action="store_true", default=True,
+                      help="Stratified 50/50 batches in Stage 3 (default: on)")
+    loss.add_argument("--no-stratify", dest="stratify", action="store_false",
+                      help="Disable stratified batching")
+    loss.add_argument("--reshape",     dest="reshape", action="store_true", default=True,
+                      help="AUCReshaping per-epoch positive reweighting (default: on)")
+    loss.add_argument("--no-reshape",  dest="reshape", action="store_false",
+                      help="Disable AUCReshaping callback")
+    loss.add_argument("--reshape-boost", dest="reshape_boost", type=float, default=2.0,
+                      help="Weight multiplier for FN positives (default: 2.0)")
+    loss.add_argument("--reshape-cap",   dest="reshape_cap",  type=float, default=8.0,
+                      help="Max cumulative boost per sample (default: 8.0)")
+    loss.add_argument("--qv-eps", dest="qv_eps", type=float, default=2e-6,
+                      help="Absmedian eps for Value projection in BitMHSA (default: 2e-6)")
+
+    # ── Data files (positional) ───────────────────────────────────────────────
+    data = parser.add_argument_group("Data files  (required for training/sweep)")
+    data.add_argument("SignalTrainFile",       nargs="?", type=str,
+                      metavar="SIGNAL_TRAIN_H5")
+    data.add_argument("BkgTrainFile",          nargs="?", type=str,
+                      metavar="BKG_TRAIN_H5")
+    data.add_argument("sig_jetData_TrainFile", nargs="?", type=str,
+                      metavar="SIGNAL_JET_H5")
+    data.add_argument("bkg_jetData_TrainFile", nargs="?", type=str,
+                      metavar="BKG_JET_H5")
 
     args = parser.parse_args()
+
+    _need_data = not all([args.SignalTrainFile, args.BkgTrainFile,
+                          args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile])
 
     if args.sanity:
         fp_edges = (not args.baseline) and args.fp_edges
         sanity_check(fp_edges=fp_edges)
     elif args.sweep:
-        if not all([args.SignalTrainFile, args.BkgTrainFile,
-                    args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
+        if _need_data:
             parser.error("Provide all four data file arguments for --sweep")
         sweep_mode(args)
     elif args.wandb_sweep:
-        if not all([args.SignalTrainFile, args.BkgTrainFile,
-                    args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
+        if _need_data:
             parser.error("Provide all four data file arguments for --wandb-sweep")
         wandb_sweep_mode(args)
     else:
-        if not all([args.SignalTrainFile, args.BkgTrainFile,
-                    args.sig_jetData_TrainFile, args.bkg_jetData_TrainFile]):
+        if _need_data:
             parser.error("Provide all four data file arguments, or use --sanity")
         main(args)
