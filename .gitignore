@@ -3,35 +3,33 @@ __pycache__/
 *.pyc
 *.pyo
 
-# HLS generated project directories (large, auto-generated)
-models/hls4ml_deepsets_v2/
-models/hls4ml_deepsets_prj/
-models/hls4ml_deepsets_debug/
-models/hls4ml_deepsets_iostream/
+# Logs
+*.log
+nohup.out
+nohup_*.log
+sweep.log
 
-# hls4ml software installation (install separately)
+# Data files (large, stored outside the repo)
+*.root
+*.h5
+*.npy
+
+# Model artifacts and HLS-generated projects
+models/
 software/
+
+# Experiment tracking
+wandb/
+
+# Generated plot outputs (ROC curves, loss/AUC/kinematics plots, model diagrams).
+# Documentation assets under docs/ are kept tracked via the negations below.
+*.png
+*.pdf
+!docs/**/*.png
+!docs/**/*.pdf
 
 # Claude Code internal
 .claude/
 
-# Logs
-*.log
-<<<<<<< HEAD
-*.log
-*.root
-nohup.out
-__pycache__/
-=======
-
-# Add to .gitignore
-echo "*.log" >> .gitignore
-echo "*.root" >> .gitignore
-echo "nohup.out" >> .gitignore
-echo "__pycache__/" >> .gitignore
->>>>>>> b6e3453 (feat: add bnjettag package and train.py entrypoint)
-models/
-wandb/
-*.h5
-*.npy
-nohup.out
+# Accidentally nested clone of this repo (kept on disk, not tracked)
+BNJetTagKai/

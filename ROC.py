@@ -1,3 +1,4 @@
+import argparse
 import os
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
@@ -21,20 +22,19 @@ from bnjettag.layers import (
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-SIG_TEST = (
-    "/home/users/russelld/L1JetTagDaniel/hls4mlModifications"
-    "/10-08-23/02-02_datasets/ReversedPhi_Eta/4c_4b_testData.h5"
+# New May-2026 dataset (key "jet_constituents", shape N×141; label in column 140).
+# Paths mirror bnjettag/config.py; override with --sig-test / --qcd-test if data moved.
+_DATA_ROOT = (
+    "/home/users/russelld/TOOLLIP_TESTS/cmssw-tests/clean_SCRAM"
+    "/CMSSW_15_1_0_pre4/src/L1LLPJetTag/data"
 )
-QCD_TEST = (
-    "/home/users/russelld/L1JetTagDaniel/hls4mlModifications"
-    "/10-08-23/02-02_datasets/ReversedPhi_Eta/QCD"
-    "/testingDatapt20_vDter_wEdits4ff.h5"
-)
-BITNET_MODEL = (
+DEFAULT_SIG_TEST = f"{_DATA_ROOT}/test_merged/phi60_bbbb_merged_testPart.h5"
+DEFAULT_QCD_TEST = f"{_DATA_ROOT}/QCD_Pt15To3000_Flat_PU200/Bkg_test.h5"
+DEFAULT_BITNET_MODEL = (
     "models/transformer_d64_l3_ffn128_kd/"
     "noNorm_train_d64_l3_ffn128_bitnetJetTagModel.h5"
 )
-FP32_MODEL = (
+DEFAULT_FP32_MODEL = (
     "models/transformer_fp32_d64_l3_ffn128/"
     "transformer_fp32_d64_l3_ffn128.keras"
 )
@@ -49,10 +49,21 @@ def tpr_at_fpr(fpr, tpr, target):
     return float(np.interp(target, fpr, tpr))
 
 
-with h5py.File(SIG_TEST, "r") as hf:
-    dataset = hf["Testing Data"][:]
-with h5py.File(QCD_TEST, "r") as hf:
-    dataset_qcd = hf["Testing Data"][:]
+parser = argparse.ArgumentParser(description="Plot BitNet jet-tagger ROC curve.")
+parser.add_argument("--sig-test", default=DEFAULT_SIG_TEST,
+                    help="HDF5 file with signal test data.")
+parser.add_argument("--qcd-test", default=DEFAULT_QCD_TEST,
+                    help="HDF5 file with QCD background test data.")
+parser.add_argument("--bitnet-model", default=DEFAULT_BITNET_MODEL,
+                    help="Path to the trained BitNet model.")
+parser.add_argument("--fp32-model", default=DEFAULT_FP32_MODEL,
+                    help="Path to the FP32 baseline model (optional).")
+args = parser.parse_args()
+
+with h5py.File(args.sig_test, "r") as hf:
+    dataset = hf["jet_constituents"][:]
+with h5py.File(args.qcd_test, "r") as hf:
+    dataset_qcd = hf["jet_constituents"][:]
 
 dataset = np.concatenate((dataset, dataset_qcd))
 np.random.default_rng(42).shuffle(dataset)
@@ -72,12 +83,12 @@ custom_objects = {
 plt.figure(figsize=(8, 6))
 
 models = [
-    ("BitNet d64 l3 KD", BITNET_MODEL, custom_objects),
+    ("BitNet d64 l3 KD", args.bitnet_model, custom_objects),
 ]
-if os.path.exists(FP32_MODEL):
-    models.append(("FP32 transformer d64 l3", FP32_MODEL, None))
+if os.path.exists(args.fp32_model):
+    models.append(("FP32 transformer d64 l3", args.fp32_model, None))
 else:
-    print(f"FP32 baseline not found, skipping: {FP32_MODEL}")
+    print(f"FP32 baseline not found, skipping: {args.fp32_model}")
 
 for model_label, model_path, model_custom_objects in models:
     model = load_model(model_path, custom_objects=model_custom_objects, compile=False)
