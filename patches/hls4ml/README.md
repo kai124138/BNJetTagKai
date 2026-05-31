@@ -33,6 +33,29 @@ See the individual `.md` files in this directory for the exact diffs.
 
 ## Apply
 
+### Recommended: automated (from repo root)
+
+The one-shot bootstrap clones hls4ml at a pinned commit, applies all three
+patches, and does the editable install:
+
+```bash
+bash hls4ml/setup_hls4ml.sh
+```
+
+If you already have a clone, apply just the patches with the idempotent applier:
+
+```bash
+python patches/hls4ml/apply_patches.py --hls4ml-root software/hls4ml
+cd software/hls4ml && pip install -e .
+```
+
+The applier uses anchored string replacement (not line numbers), so it is
+resilient to upstream drift and safe to run twice — already-patched files are
+skipped. If an anchor can't be found it fails loudly and points you back to the
+`.md` diffs below for the manual edit.
+
+### Manual fallback
+
 After cloning hls4ml under `software/hls4ml/`, manually edit the three files
 listed above using the diffs in this directory. Then re-install:
 

@@ -14,8 +14,11 @@ sweep.log
 *.h5
 *.npy
 
-# Model artifacts and HLS-generated projects
-models/
+# Model artifacts and HLS-generated projects.
+# Ignore everything under models/ EXCEPT the doc that explains what belongs
+# there. (Ignore the contents, not the dir itself, so the negation can match.)
+models/*
+!models/MODEL.md
 software/
 
 # Experiment tracking

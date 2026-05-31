@@ -125,14 +125,20 @@ clone before `hls_convert_v2.py` will produce correct output.
 
 Current state (`hls_convert_v2.py` with all patches applied):
 - `input_proj`: correlation 1.000 ✓
-- `input_norm`: correlation 0.955, with a remaining ~2× amplification under
-  investigation
-- Downstream layers: still need work — `input_norm` amplification cascades
+- `input_norm`: the ~2× amplification has been **fixed** (2026-05-31). Root
+  cause was a LUT *range* mismatch, not `accum_t` resolution: `input_norm`'s
+  tiny variances (~0.009–0.046) occupied only the bottom ~4.6% of a `[0, 1)`
+  table, so the steep low-index region of `1/sqrt(var)` was undersampled and
+  read ~2× high. Fixed by setting `table_range_power2 = 4` (range `[0, 2^-4)`)
+  so the variance band spans the full LUT, and widening `table_t` to
+  `ap_fixed<18,6>`. See Step 7 in `docs/hls4ml_precision_bugs.md`.
+- Downstream layers: re-run `hls4ml/hls_trace.py` to confirm the cascade clears
+  now that `input_norm` is correct.
 
-The remaining hypothesis (from `docs/hls4ml_precision_bugs.md`) is that
-`accum_t` resolution is still insufficient for the smallest variances
-(~0.009), causing the variance to round to roughly ¼ of its true value and
-giving 2× amplification in `1/sqrt(var)`.
+This generalizes the earlier large-variance fix: small variances need
+`table_range_power2 > 0` (raise the resolution floor) just as the post-residual
+layers need `table_range_power2 < 0` (extend the ceiling). Per-layer ranges are
+mandatory in both directions.
 
 ### 4. Synthesis (queued behind accuracy)
 
@@ -172,9 +178,24 @@ cd hls4ml
 pip install -e .
 ```
 
-Then apply the three patches in `patches/hls4ml/`. They are documented as
-before/after snippets — see `patches/hls4ml/README.md` for details. Without
-these patches the LayerNorm output will be wrong.
+Then apply the three required LayerNorm patches. The fastest path is the
+one-shot bootstrap, which clones hls4ml at a pinned commit, applies all three
+patches, and installs it:
+
+```bash
+bash hls4ml/setup_hls4ml.sh
+```
+
+For an existing clone, run the idempotent applier directly:
+
+```bash
+python patches/hls4ml/apply_patches.py --hls4ml-root software/hls4ml
+cd software/hls4ml && pip install -e .
+```
+
+The patches are also documented as before/after snippets in
+`patches/hls4ml/` for manual application. Without these patches the LayerNorm
+output will be wrong.
 
 ### Vivado HLS (for synthesis only)
 

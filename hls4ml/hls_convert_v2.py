@@ -35,8 +35,18 @@ CLOCK_NS    = 5
 LN_CONFIGS = {
     # accum must hold: sum_cache2 (int range) AND k_inv=1/64=0.015625 (>=6 frac bits)
     # ap_fixed<32,10>: max=511 >= 256 (64*4), 22 frac bits → k_inv exact, small var preserved
-    'input_norm':      {'table_range_power2':  0,  'accum': 'ap_fixed<32,10>',
-                        'table': 'ap_fixed<16,6>'},
+    #
+    # input_norm FIX (2026-05-31): the previous table_range_power2=0 (range [0,1))
+    # gave a ~2x output amplification. input_proj output is in [-1,1] so per-sample
+    # variance is tiny (~0.009-0.046), occupying only the bottom ~4.6% of a [0,1)
+    # LUT. With table_size=4096 the smallest variance (0.009) lands at index ~37 and
+    # the inverse-sqrt entry there is too coarsely sampled, so 1/sqrt(var) reads ~2x
+    # high and the normalized output doubles. Tightening the range to 2^-4 = 0.0625
+    # (table_range_power2 = 4) puts the full observed variance band across nearly the
+    # whole table, restoring resolution. table_t widened to ap_fixed<18,6> to hold the
+    # larger 1/sqrt(var) values (up to ~10.5) with extra fractional precision.
+    'input_norm':      {'table_range_power2':  4,  'accum': 'ap_fixed<32,10>',
+                        'table': 'ap_fixed<18,6>'},
     # ap_fixed<32,15>: max=16383 >= 12544 (64*196), 17 frac bits → k_inv=2048/2^17 exact
     'ds_block_0_norm1':{'table_range_power2':  0,  'accum': 'ap_fixed<32,15>',
                         'table': 'ap_fixed<16,6>'},
@@ -72,6 +82,10 @@ for ln, lncfg in LN_CONFIGS.items():
             "scale":   "ap_fixed<16,6>",
             "bias":    "ap_fixed<16,6>",
             "table":   lncfg["table"],
+            # table_t mirrors 'table'; required so the patched _set_type_t('table')
+            # in layers.py actually honors our table precision instead of the
+            # backend default ap_ufixed<8,5> (see docs/hls4ml_layernorm_patches.md).
+            "table_t": lncfg["table"],
             "accum":   lncfg["accum"],
         },
     })

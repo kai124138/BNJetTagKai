@@ -85,8 +85,11 @@ LN_CONFIGS = {
     # accum must hold: sum_cache2 (int range) AND k_inv=1/64=0.015625 (>=6 frac bits)
     # io_stream needs additional integer headroom here; ap_fixed<32,16> keeps
     # the small input variances resolved while avoiding saturation in C-sim.
-    'input_norm':      {'table_range_power2':  0,  'accum': 'ap_fixed<32,16>',
-                        'table': 'ap_fixed<16,6>'},
+    # input_norm FIX (2026-05-31): same root cause as io_parallel -- tiny variances
+    # (~0.009-0.046) under-sampled the bottom of a [0,1) LUT, reading 1/sqrt(var)
+    # ~2x high. Tighten range to 2^-4=0.0625 (table_range_power2=4); widen table_t.
+    'input_norm':      {'table_range_power2':  4,  'accum': 'ap_fixed<32,16>',
+                        'table': 'ap_fixed<18,6>'},
     # ap_fixed<32,15>: max=16383 >= 12544 (64*196), 17 frac bits -> k_inv=2048/2^17 exact
     'ds_block_0_norm1':{'table_range_power2':  0,  'accum': 'ap_fixed<32,15>',
                         'table': 'ap_fixed<16,6>'},
@@ -122,6 +125,8 @@ for ln, lncfg in LN_CONFIGS.items():
             "scale":   "ap_fixed<16,6>",
             "bias":    "ap_fixed<16,6>",
             "table":   lncfg["table"],
+            # table_t mirrors 'table' so the patched _set_type_t('table') honors it.
+            "table_t": lncfg["table"],
             "accum":   lncfg["accum"],
         },
     })

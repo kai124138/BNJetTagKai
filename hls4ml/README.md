@@ -25,6 +25,7 @@ relative to the repo root.)
 | `hls_trace.py`       | Layer-by-layer comparison: Keras vs HLS C-sim per layer output. |
 | `hls_debug.py`       | Sanity check with wide global precision (`ap_fixed<32,16>`).    |
 | `hls_build.py`       | Runs Vivado HLS synthesis (`hls_model.build()`) — long. ~30–60min on the target part. |
+| `setup_hls4ml.sh`    | Bootstrap: clone hls4ml at a pinned commit, apply the LayerNorm patches, editable-install. Run from repo root. |
 
 ## Prerequisites
 
@@ -62,11 +63,17 @@ residual blocks (`ds_block_1_norm1` onward, vars up to ~3800).
 
 | Layer              | `table_range_power2` | `accum_t`          | `table_t`        |
 | ------------------ | -------------------- | ------------------ | ---------------- |
-| `input_norm`       | 0                    | `ap_fixed<32,10>`  | `ap_fixed<16,6>` |
+| `input_norm`       | 4                    | `ap_fixed<32,10>`  | `ap_fixed<18,6>` |
 | `ds_block_0_norm1` | 0                    | `ap_fixed<32,15>`  | `ap_fixed<16,6>` |
 | `ds_block_1_norm1` | -12                  | `ap_fixed<32,23>`  | `ap_fixed<24,8>` |
 | `ds_block_2_norm1` | -12                  | `ap_fixed<32,23>`  | `ap_fixed<24,8>` |
 | `final_norm`       | -12                  | `ap_fixed<32,23>`  | `ap_fixed<24,8>` |
+
+`input_norm` uses a **positive** `table_range_power2 = 4` (range `[0, 2^-4)`):
+its variances are tiny (~0.009–0.046), so the LUT range is tightened down to
+raise resolution — the mirror image of the post-residual layers that use
+negative powers to extend the range up to ~4096. This fixed the ~2×
+amplification documented as Step 7 in `docs/hls4ml_precision_bugs.md`.
 
 Dense layers and the `add` residual outputs are also given individually-sized
 result precisions — see `LN_CONFIGS` and `dense_result_prec` in

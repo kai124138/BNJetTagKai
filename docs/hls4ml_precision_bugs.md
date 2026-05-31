@@ -98,6 +98,39 @@ early on and it broke the small-variance layers: with `input_norm` variance
 returns `1/sqrt(0.001) ≈ 31.6` — orders of magnitude wrong. Per-layer
 configuration is mandatory.
 
+## Step 7 — Fix the `input_norm` 2× amplification (2026-05-31)
+
+With all three patches applied, the first remaining divergence was at
+`input_norm`: correlation 0.955 but a clean ~2× over-amplification
+(Keras `[-6.2, 5.9]` vs HLS `[-13.2, 11.6]`). A clean 2× on the output means
+`1/sqrt(var)` is ~2× too large, i.e. the variance fed to the LUT reads ~4× too
+small.
+
+The cause was **LUT range mismatch, not `accum_t` resolution** (the earlier
+hypothesis). `input_norm` sees `input_proj` output in `[-1, 1]`, so its
+per-sample variance is tiny (~0.009–0.046). With `table_range_power2 = 0` the
+LUT covers `[0, 1)`, so those variances occupy only the bottom ~4.6% of the
+table — indices 0–188 of 4096. At the smallest variance (0.009 → index ~37)
+the inverse-sqrt curve is steepest and most coarsely sampled, so the lookup
+reads `1/sqrt(var)` materially high, doubling the normalized output.
+
+**Fix:** tighten the range so the observed variance band spans the whole table.
+Since `max var ≈ 0.046 < 0.0625 = 2^-4`, set `table_range_power2 = 4` (range
+`[0, 2^-4)`). Now variance 0.046 lands near index ~3014 instead of ~188, giving
+full LUT resolution across the band. `table_t` was also widened from
+`ap_fixed<16,6>` to `ap_fixed<18,6>` to hold the larger `1/sqrt(var)` values
+(up to ~10.5) with extra fractional precision. The same change was mirrored in
+`hls_convert_iostream.py` and `hls_trace.py`.
+
+This generalizes Step 5's range insight: **both very large and very small
+variances need a per-layer range** — large ones need `table_range_power2 < 0`
+to extend the ceiling, small ones need `table_range_power2 > 0` to raise the
+resolution floor. Only the mid-range layers (`ds_block_0_norm1`, var ~0.83) are
+well served by the default `[0, 1)`.
+
+Re-run `python hls4ml/hls_trace.py` and confirm `input_norm` correlation climbs
+toward ~1.0 before evaluating the downstream cascade.
+
 ## Lessons learned
 
 - **A correlation of -0.02 is a "totally broken" signal, not a "needs more

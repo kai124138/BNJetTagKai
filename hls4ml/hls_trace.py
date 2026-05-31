@@ -17,7 +17,11 @@ LN_CONFIGS = {
     #   k_inv = 1/dim = 1/64 = 0.015625 = 2^-6  (needs >=6 fractional bits)
     #   var = sum_cache2 * k_inv  (needs enough frac bits so small variances don't truncate to 0)
     # ap_fixed<32,10>: max=511 (>256=64*4), 22 frac bits (k_inv=4194304/2^22 exact, var=0.001 -> 4194 ok)
-    'input_norm':      {'table_range_power2':  0, 'accum': 'ap_fixed<32,10>', 'table': 'ap_fixed<16,6>'},
+    # input_norm FIX (2026-05-31): range tightened to 2^-4=0.0625 (table_range_power2=4)
+    # so the tiny observed variances (~0.009-0.046) span the full LUT instead of the
+    # bottom ~4.6%. Previously the coarse low-index sampling read 1/sqrt(var) ~2x high,
+    # doubling the input_norm output ([-13,11] vs Keras [-6,6]). table_t widened to <18,6>.
+    'input_norm':      {'table_range_power2':  4, 'accum': 'ap_fixed<32,10>', 'table': 'ap_fixed<18,6>'},
     # ap_fixed<32,15>: max=16383 (>12544=64*196), 17 frac bits (k_inv=2048/2^17 exact)
     'ds_block_0_norm1':{'table_range_power2':  0, 'accum': 'ap_fixed<32,15>', 'table': 'ap_fixed<16,6>'},
     'ds_block_1_norm1':{'table_range_power2': -12,'accum': 'ap_fixed<32,23>', 'table': 'ap_fixed<24,8>'},
