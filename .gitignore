@@ -17,3 +17,7 @@ software/
 
 # Logs
 *.log
+*.log
+*.root
+nohup.out
+__pycache__/
