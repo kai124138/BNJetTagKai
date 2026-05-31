@@ -27,7 +27,9 @@ cfg["Model"]["Precision"]["default"] = "ap_fixed<16,6>"
 cfg["Model"]["ReuseFactor"] = 64
 
 LN_CONFIGS = {
-    "input_norm":      {"table_range_power2":  0, "accum": "ap_fixed<32,10>", "table": "ap_fixed<16,6>"},
+    # input_norm FIX (2026-05-31): range tightened to 2^-4=0.0625 (table_range_power2=4)
+    # to fix the ~2x amplification; must match hls_convert_v2.py. See docs/hls4ml_precision_bugs.md.
+    "input_norm":      {"table_range_power2":  4, "accum": "ap_fixed<32,10>", "table": "ap_fixed<18,6>"},
     "ds_block_0_norm1":{"table_range_power2":  0, "accum": "ap_fixed<32,15>", "table": "ap_fixed<16,6>"},
     "ds_block_1_norm1":{"table_range_power2":-12, "accum": "ap_fixed<32,23>", "table": "ap_fixed<24,8>"},
     "ds_block_2_norm1":{"table_range_power2":-12, "accum": "ap_fixed<32,23>", "table": "ap_fixed<24,8>"},
