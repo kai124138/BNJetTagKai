@@ -14,3 +14,7 @@ Please restart Codex inside a `tmux` session with a fresh `GITHUB_TOKEN` exporte
 ## 2026-05-11 Item 4 FP32 training deferred
 
 Item 4 FP32 training deferred — no GPU visible from current shell (TF sees 0 physical GPUs). Run training/transformer_fp32.py when GPU access is available.
+
+## 2026-05-11 Item 7 synthesis deferred
+
+Item 7 synthesis (io_parallel + io_stream) is not yet run. Current state is ready for synthesis with v2 and io_stream C-sim correlations reported.

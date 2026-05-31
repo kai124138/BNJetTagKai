@@ -9,7 +9,7 @@ import tensorflow as tf
 from sklearn.metrics import auc, roc_curve
 from tensorflow.keras.models import load_model
 
-from qkerasModel import (
+from bnjettag.layers import (
     AbsMeanQuantizer,
     BitFFN,
     BitLinear,

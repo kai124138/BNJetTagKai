@@ -1,0 +1,116 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            ekowhh07y92q15721wm2zfsncu2j00lv:
+                args:
+                    - --wandb
+                    - --wandb-project
+                    - bnjettagkai
+                    - --wandb-entity
+                    - kayamaguchi-uc-san-diego
+                    - --wandb-tags
+                    - new-data,may2026,quick
+                    - --arch
+                    - deepsets
+                codePath: qkerasModel.py
+                codePathLocal: qkerasModel.py
+                cpu_count: 32
+                cpu_count_logical: 64
+                disk:
+                    /:
+                        total: "199900393472"
+                        used: "158818897920"
+                email: kayamaguchi@ucsd.edu
+                executable: /home/users/kayamaguchi/micromamba/envs/bnjet/bin/python
+                git:
+                    commit: 4c02c5fb10eb6bd1dc945715a704f55be3ff3681
+                    remote: https://github.com/kai124138/BNJetTagKai.git
+                host: mulder.t2.ucsd.edu
+                memory:
+                    total: "134749081600"
+                os: Linux-4.18.0-425.3.1.el8.x86_64-x86_64-with-glibc2.28
+                program: /home/users/kayamaguchi/BNJetTagKai/qkerasModel.py
+                python: CPython 3.10.10
+                root: /home/users/kayamaguchi/BNJetTagKai
+                startedAt: "2026-05-31T04:43:46.799776Z"
+                writerId: ekowhh07y92q15721wm2zfsncu2j00lv
+        m: []
+        python_version: 3.10.10
+        t:
+            "1":
+                - 2
+                - 3
+                - 5
+                - 53
+            "2":
+                - 2
+                - 3
+                - 5
+                - 53
+            "3":
+                - 13
+                - 15
+                - 16
+                - 61
+                - 62
+            "4": 3.10.10
+            "5": 0.26.1
+            "12": 0.26.1
+            "13": linux-x86_64
+act_quant:
+    value: int8
+arch:
+    value: deepsets
+auc_loss:
+    value: pauc1way
+baseline:
+    value: false
+batch_size:
+    value: 50
+bkg_jet_file:
+    value: Bkg_trainJets.h5
+bkg_part_file:
+    value: Bkg_train.h5
+d_model:
+    value: 32
+epochs:
+    value: 200
+ffn_dim:
+    value: 64
+focal_weight:
+    value: 0.3
+fp_edges:
+    value: true
+fpr_thresh:
+    value: 0.01
+kd_temp:
+    value: 2
+kd_weight:
+    value: 0.3
+n_layers:
+    value: 2
+pauc_weight:
+    value: 0.7
+peak_lr:
+    value: 0.0003
+qv_eps:
+    value: 2e-06
+reshape:
+    value: true
+run_tag:
+    value: models/deepsets_d32_l2_ffn64/deepsets_noNorm_train_d32_l2_ffn64
+sig_jet_file:
+    value: merged_trainJet.h5
+sig_part_file:
+    value: merged_trainPart.h5
+stoch_round:
+    value: true
+stratify:
+    value: true
+test_dir:
+    value: test_merged
+tpr_floor:
+    value: 0.8
+weight_decay:
+    value: 0.01

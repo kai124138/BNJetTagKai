@@ -17,7 +17,16 @@ software/
 
 # Logs
 *.log
+<<<<<<< HEAD
 *.log
 *.root
 nohup.out
 __pycache__/
+=======
+
+# Add to .gitignore
+echo "*.log" >> .gitignore
+echo "*.root" >> .gitignore
+echo "nohup.out" >> .gitignore
+echo "__pycache__/" >> .gitignore
+>>>>>>> b6e3453 (feat: add bnjettag package and train.py entrypoint)

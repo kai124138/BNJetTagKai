@@ -1,0 +1,39 @@
+{
+  "os":  "Linux-4.18.0-425.3.1.el8.x86_64-x86_64-with-glibc2.28",
+  "python":  "CPython 3.10.10",
+  "startedAt":  "2026-05-31T04:43:46.799776Z",
+  "args":  [
+    "--wandb",
+    "--wandb-project",
+    "bnjettagkai",
+    "--wandb-entity",
+    "kayamaguchi-uc-san-diego",
+    "--wandb-tags",
+    "new-data,may2026,quick",
+    "--arch",
+    "deepsets"
+  ],
+  "program":  "/home/users/kayamaguchi/BNJetTagKai/qkerasModel.py",
+  "codePath":  "qkerasModel.py",
+  "codePathLocal":  "qkerasModel.py",
+  "git":  {
+    "remote":  "https://github.com/kai124138/BNJetTagKai.git",
+    "commit":  "4c02c5fb10eb6bd1dc945715a704f55be3ff3681"
+  },
+  "email":  "kayamaguchi@ucsd.edu",
+  "root":  "/home/users/kayamaguchi/BNJetTagKai",
+  "host":  "mulder.t2.ucsd.edu",
+  "executable":  "/home/users/kayamaguchi/micromamba/envs/bnjet/bin/python",
+  "cpu_count":  32,
+  "cpu_count_logical":  64,
+  "disk":  {
+    "/":  {
+      "total":  "199900393472",
+      "used":  "158818897920"
+    }
+  },
+  "memory":  {
+    "total":  "134749081600"
+  },
+  "writerId":  "ekowhh07y92q15721wm2zfsncu2j00lv"
+}

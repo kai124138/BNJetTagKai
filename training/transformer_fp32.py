@@ -85,7 +85,7 @@ def focal_loss(gamma=1.0, alpha=0.5):
 
 
 def load_training_data(signal_train, bkg_train, signal_jetdata, bkg_jetdata, seed):
-    """Mirror qkerasModel.py data concatenation, shuffle, reshape, and pT weights."""
+    """Mirror train.py data concatenation, shuffle, reshape, and pT weights."""
     print("Reading signal from " + signal_train)
     print("Reading background from " + bkg_train)
     print("Reading signal jet data from " + signal_jetdata)
