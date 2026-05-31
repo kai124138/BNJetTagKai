@@ -30,3 +30,8 @@ echo "*.root" >> .gitignore
 echo "nohup.out" >> .gitignore
 echo "__pycache__/" >> .gitignore
 >>>>>>> b6e3453 (feat: add bnjettag package and train.py entrypoint)
+models/
+wandb/
+*.h5
+*.npy
+nohup.out

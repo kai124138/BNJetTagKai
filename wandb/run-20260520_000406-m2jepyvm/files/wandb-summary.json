@@ -1,1 +1,0 @@
-{"val_binary_accuracy":0.8666666746139526,"_step":5,"_timestamp":1.7792606975359745e+09,"loss":7.677670001983643,"val_loss":7.677641868591309,"best_val_loss":1.0198845863342285,"_runtime":47,"best_epoch":0,"s2_kd/train_loss":0.2523103132843971,"epoch":5,"binary_accuracy":0.8620689511299133,"s2_kd/val_loss":0.16525530815124512,"_wandb":{"runtime":47}}

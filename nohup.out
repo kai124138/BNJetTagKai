@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "qkerasModel.py", line 47, in <module>
-    import h5py
-ModuleNotFoundError: No module named 'h5py'
-Traceback (most recent call last):
-  File "qkerasModel.py", line 47, in <module>
-    import h5py
-ModuleNotFoundError: No module named 'h5py'
