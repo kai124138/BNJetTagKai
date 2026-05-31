@@ -76,9 +76,11 @@ negative powers to extend the range up to ~4096. This fixed the ~2×
 amplification documented as Step 7 in `docs/hls4ml_precision_bugs.md`.
 
 Dense layers and the `add` residual outputs are also given individually-sized
-result precisions — see `LN_CONFIGS` and `dense_result_prec` in
-`hls_convert_v2.py` for the exact values and the rationale per layer in the
-inline comments.
+result precisions. All precision now lives in one place —
+`bnjettag/hls_precision.py` (`build_hls_config(model, io_type=...)`) — with the
+exact per-layer values and rationale. The four scripts here import from it; do
+not re-inline configs. (Historically these lived inline as `LN_CONFIGS` /
+`dense_result_prec` in each script and drifted out of sync.)
 
 The io_stream variant starts from the same LayerNorm settings but adds a
 generated-project stream overload for LayerNorm before C-sim. Its dense and

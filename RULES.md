@@ -28,7 +28,10 @@ next. An LLM that fixes a bug but doesn't record *what* it fixed, *why*, and
 Do these in order. Steps 1, 6, and 7 are **mandatory** — never skip them.
 
 ### 1. Orient before you touch anything
-- Read `RULES.md` (this file), `README.md`, and `docs/NEXT_STEPS.md`.
+- Read `RULES.md` (this file), `docs/REPO_MAP.md` (one-line index of every
+  file), `README.md`, and `docs/NEXT_STEPS.md`. For non-obvious decisions and
+  already-settled questions, consult `docs/GLOSSARY.md` before "fixing" things
+  that look wrong.
 - Skim the most recent `docs/session_summary_*.md` and `docs/codex_questions.md`
   for open questions and blockers.
 - Run `git log --oneline -15` and `git status` to see what just happened and
@@ -177,7 +180,8 @@ See the version-control section below.
 
 ## For LLMs specifically — a short checklist to self-verify before you stop
 
-- [ ] I read `RULES.md`, `README.md`, and `docs/NEXT_STEPS.md` at the start.
+- [ ] I read `RULES.md`, `docs/REPO_MAP.md`, `README.md`, and
+      `docs/NEXT_STEPS.md` at the start (and checked `docs/GLOSSARY.md`).
 - [ ] My code change is focused and style-matching.
 - [ ] I syntax-checked / `bash -n`'d what I edited.
 - [ ] I updated every doc the change affects, with no stale numbers.

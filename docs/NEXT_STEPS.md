@@ -80,11 +80,12 @@ python training/transformer_fp32.py <train.h5> <test.h5> ...
 
 ## Things to watch out for (gotchas already hit)
 
-- **Three copies of the precision config exist** — `hls_convert_v2.py`,
-  `hls_convert_iostream.py`, `hls_trace.py`, and `hls_build.py` each inline
-  their own `LN_CONFIGS`. They're now consistent for `input_norm`, but any
-  future precision change has to be made in **all** of them. (Worth refactoring
-  into a single shared `bnjettag/hls_precision.py` someday — see below.)
+- **Precision now lives in ONE place** — `bnjettag/hls_precision.py`
+  (`build_hls_config(model, io_type=...)`). The four scripts import from it; the
+  old per-script `LN_CONFIGS` copies (which had drifted) are gone. Change
+  precision THERE. Two profiles exist on purpose: `io_parallel` (verified path)
+  and `io_stream` (wider types). Run `python util/verify_hls_precision_refactor.py`
+  to confirm the module still matches the historical inline configs.
 - **`hls_model.compile()` regenerates firmware** — never hand-edit
   `defines.h` / `parameters.h`; fixes go in the Python config or the hls4ml
   source patches.
@@ -101,8 +102,8 @@ python training/transformer_fp32.py <train.h5> <test.h5> ...
 
 ## Nice-to-haves (not blocking)
 
-- Refactor the four duplicated `LN_CONFIGS` / `dense_*_prec` blocks into one
-  shared module so precision lives in a single place.
+- ~~Refactor the four duplicated `LN_CONFIGS` / `dense_*_prec` blocks into one
+  shared module~~ — DONE (2026-05-31): `bnjettag/hls_precision.py`.
 - Make `DATA_DIR` an env var / CLI arg instead of a hardcoded path.
 - Add a tiny smoke test that asserts the generated `defines.h` contains the
   expected `*_table_t` typedefs (catches "config silently ignored" regressions).
@@ -137,6 +138,9 @@ The bracketed sentence is intentionally a placeholder — fill it in after steps
 
 ## Pointers
 
+- Repo file index: `docs/REPO_MAP.md`
+- Decided questions / non-obvious facts: `docs/GLOSSARY.md`
+- Precision config (single source of truth): `bnjettag/hls_precision.py`
 - Bug diagnosis story: `docs/hls4ml_precision_bugs.md` (Step 7 = the
   `input_norm` fix)
 - Patch rationale: `docs/hls4ml_layernorm_patches.md`

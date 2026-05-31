@@ -1,7 +1,14 @@
-"""
-Debug HLS4ML conversion for DeepSets model.
-Step 1: Use wide precision (ap_fixed<32,16>) to rule out overflow.
-Step 2: Enable tracing to find the first diverging layer.
+"""Early debug scratchpad for the DeepSets hls4ml conversion. [LEGACY]
+
+Status
+    Superseded by hls_trace.py (per-layer trace) and hls_convert_v2.py (full
+    C-sim with the verified precision profile). Kept for reference only.
+    Strategy here: use uniformly wide precision (ap_fixed<32,16>) to rule out
+    overflow, then trace to find the first diverging layer — the same idea now
+    handled properly by the shared bnjettag/hls_precision.py config.
+
+For new work, prefer hls_trace.py / hls_convert_v2.py. Run (from repo root):
+    python hls4ml/hls_debug.py
 """
 import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"

@@ -5,6 +5,53 @@ format — every session that changes the repo appends an entry here.
 
 ---
 
+## 2026-05-31 — Centralize hls4ml precision + add REPO_MAP, GLOSSARY, script docs
+
+**Who:** Claude (LLM)
+**Commits:** (this commit)
+
+### What changed
+- Added `bnjettag/hls_precision.py`: the single source of truth for the DeepSets
+  hls4ml precision config. `build_hls_config(model, io_type=...)` returns the
+  full config; `enable_trace(cfg)` flips Trace on. Two intentional profiles:
+  `io_parallel` and `io_stream`.
+- Rewired all four scripts (`hls_convert_v2.py`, `hls_trace.py`, `hls_build.py`,
+  `hls_convert_iostream.py`) to import from it; removed the four inlined
+  `LN_CONFIGS` / `dense_*_prec` blocks.
+- Added `util/verify_hls_precision_refactor.py`: stubs hls4ml and proves the new
+  module reproduces the OLD inline configs byte-for-byte (both profiles).
+- Added top-of-file docstrings (what it does / how to run / inputs / outputs) to
+  all five `hls4ml/` scripts; marked `hls_debug.py` as legacy.
+- Added `docs/REPO_MAP.md` (one-line index of every file) and `docs/GLOSSARY.md`
+  (decided questions / non-obvious facts).
+- Pointed `RULES.md`, `README.md`, and `hls4ml/README.md` at the new docs and
+  the shared precision module; fixed a stale `LN_CONFIGS` reference.
+
+### Why
+- The precision config was copy-pasted into four scripts and had **drifted** —
+  `hls_build.py` had stopped setting the LN `scale`/`bias`/`table` keys, so
+  synthesis risked baking a different config into firmware than the C-sim
+  verified. Centralizing removes that whole class of bug.
+- REPO_MAP / GLOSSARY / docstrings cut the cost of every future session (human
+  or LLM): orient + recall settled decisions without re-reading ~7k lines of
+  code or re-deriving things like the head_fc2 artifact.
+
+### Verified
+- `util/verify_hls_precision_refactor.py`: both `io_parallel` and `io_stream`
+  configs from the new module are **byte-for-byte identical** to the historical
+  inline configs (the io_parallel three were already equal; the test also caught
+  that io_stream `input_proj` result is `ap_fixed<32,12>`, now preserved).
+- All five scripts + the module `py_compile` clean. No inline `LN_CONFIGS`
+  remain in `hls4ml/`.
+- **NOT verified:** no new C-sim run — the config is provably identical to the
+  one already verified on 2026-05-31, and TF/hls4ml aren't installed here.
+
+### Still broken / unfinished
+- Synthesis (`hls_build.py`) still never run — the top item in `NEXT_STEPS.md`.
+- FP32 baseline still untrained (needs GPU).
+
+---
+
 ## 2026-05-31 — Record verified hls4ml C-sim results (input_norm fix confirmed)
 
 **Who:** Claude (LLM)

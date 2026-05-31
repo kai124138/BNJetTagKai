@@ -1,6 +1,28 @@
-"""
-Run Vivado HLS synthesis on the DeepSets HLS project.
-Re-runs conversion (fast, ~1min) then calls hls_model.build() for synthesis (~30-60min).
+"""Vivado HLS synthesis for the DeepSets jet tagger (io_parallel).
+
+What it does
+    Re-runs the io_parallel conversion (fast, ~1 min) with the SAME config the
+    C-sim was verified against, patches reuse_factor/array-partition in the
+    generated project, then calls hls_model.build(synth=True) and prints the
+    estimated clock, latency, interval, and LUT/FF/DSP/BRAM utilization.
+
+Run (from repo root, on a machine with Vivado 2020.1)
+    python hls4ml/hls_build.py        # ~30-60 min
+
+Needs
+    Vivado 2020.1 (vivado_hls; path hardcoded at VIVADO_BIN — edit for your
+    machine), patched hls4ml, TensorFlow, the model h5. NOTE 2023.2 uses
+    vitis_hls which this script does not target.
+
+Outputs
+    Synthesized project in models/hls4ml_deepsets_v2/ and a printed resource/
+    latency summary. As of 2026-05-31 this has NOT yet been run to completion —
+    it is the current top item in docs/NEXT_STEPS.md. Target: II=1, latency
+    < 100 cycles (see docs/paper_notes_2510.24784.md).
+
+Precision
+    All precision lives in bnjettag/hls_precision.py (io_parallel profile). This
+    script only adds ReuseFactor=64 on top. Do NOT re-inline configs here.
 """
 import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
@@ -13,6 +35,8 @@ import numpy as np
 import tensorflow as tf
 import hls4ml
 
+from bnjettag.hls_precision import build_hls_config  # single source of precision truth
+
 MODEL_PATH = "models/deepsets_d64_l3_ffn128/deepsets_clean.h5"
 HLS_DIR    = "models/hls4ml_deepsets_v2"
 PART       = "xcvu9p-flgb2104-2L-e"
@@ -21,83 +45,11 @@ CLOCK_NS   = 5
 print("Loading model...")
 model = tf.keras.models.load_model(MODEL_PATH, compile=False)
 
-# ── Re-run config (same as hls_convert_v2.py) ────────────────────────────────
-cfg = hls4ml.utils.config_from_keras_model(model, granularity="name")
-cfg["Model"]["Precision"]["default"] = "ap_fixed<16,6>"
-cfg["Model"]["ReuseFactor"] = 64
-
-LN_CONFIGS = {
-    # input_norm FIX (2026-05-31): range tightened to 2^-4=0.0625 (table_range_power2=4)
-    # to fix the ~2x amplification; must match hls_convert_v2.py. See docs/hls4ml_precision_bugs.md.
-    "input_norm":      {"table_range_power2":  4, "accum": "ap_fixed<32,10>", "table": "ap_fixed<18,6>"},
-    "ds_block_0_norm1":{"table_range_power2":  0, "accum": "ap_fixed<32,15>", "table": "ap_fixed<16,6>"},
-    "ds_block_1_norm1":{"table_range_power2":-12, "accum": "ap_fixed<32,23>", "table": "ap_fixed<24,8>"},
-    "ds_block_2_norm1":{"table_range_power2":-12, "accum": "ap_fixed<32,23>", "table": "ap_fixed<24,8>"},
-    "final_norm":      {"table_range_power2":-12, "accum": "ap_fixed<32,23>", "table": "ap_fixed<24,8>"},
-}
-for ln, lncfg in LN_CONFIGS.items():
-    if ln not in cfg["LayerName"]:
-        cfg["LayerName"][ln] = {}
-    cfg["LayerName"][ln].update({
-        "table_range_power2": lncfg["table_range_power2"],
-        "Precision": {
-            "result": "ap_fixed<16,6>",
-            "accum":  lncfg["accum"],
-        },
-    })
-    if "table_t" not in cfg["LayerName"][ln].get("Precision", {}):
-        cfg["LayerName"][ln]["Precision"]["table_t"] = lncfg["table"]
-
-dense_result_prec = {
-    "input_proj":            "ap_fixed<16,6>",
-    "ds_block_0_fc1":        "ap_fixed<16,11>",
-    "ds_block_0_fc2":        "ap_fixed<16,9>",
-    "ds_block_0_fc2_linear": "ap_fixed<16,9>",
-    "ds_block_0_add":        "ap_fixed<16,9>",
-    "ds_block_1_fc1":        "ap_fixed<16,8>",
-    "ds_block_1_fc2":        "ap_fixed<16,7>",
-    "ds_block_1_fc2_linear": "ap_fixed<16,7>",
-    "ds_block_1_add":        "ap_fixed<16,9>",
-    "ds_block_2_fc1":        "ap_fixed<16,8>",
-    "ds_block_2_fc2":        "ap_fixed<16,8>",
-    "ds_block_2_fc2_linear": "ap_fixed<16,8>",
-    "ds_block_2_add":        "ap_fixed<16,9>",
-    "head_fc1":              "ap_fixed<16,9>",
-    "head_fc2":              "ap_fixed<16,8>",
-    "head_fc2_linear":       "ap_fixed<16,8>",
-    "global_average_pooling1d": "ap_fixed<16,9>",
-}
-no_ternary = {"input_proj", "head_fc2", "head_fc2_linear", "global_average_pooling1d",
-              "ds_block_0_fc2_linear", "ds_block_1_fc2_linear", "ds_block_2_fc2_linear",
-              "ds_block_0_add", "ds_block_1_add", "ds_block_2_add"}
-for layer_name, prec in dense_result_prec.items():
-    if layer_name not in cfg["LayerName"]:
-        cfg["LayerName"][layer_name] = {}
-    if "Precision" not in cfg["LayerName"][layer_name]:
-        cfg["LayerName"][layer_name]["Precision"] = {}
-    cfg["LayerName"][layer_name]["Precision"]["result"] = prec
-    if layer_name not in no_ternary:
-        cfg["LayerName"][layer_name]["Precision"]["weight"] = "ap_int<2>"
-
-for key in ("weight", "bias"):
-    cfg["LayerName"]["head_fc2"]["Precision"][key] = "ap_fixed<16,8>"
-
-dense_accum_prec = {
-    "ds_block_0_fc1": "ap_fixed<24,10>",
-    "ds_block_0_fc2": "ap_fixed<24,12>",
-    "ds_block_1_fc1": "ap_fixed<24,10>",
-    "ds_block_1_fc2": "ap_fixed<24,10>",
-    "ds_block_2_fc1": "ap_fixed<24,10>",
-    "ds_block_2_fc2": "ap_fixed<24,12>",
-    "head_fc1":       "ap_fixed<24,10>",
-    "head_fc2":       "ap_fixed<24,12>",
-}
-for layer_name, prec in dense_accum_prec.items():
-    if layer_name not in cfg["LayerName"]:
-        cfg["LayerName"][layer_name] = {}
-    if "Precision" not in cfg["LayerName"][layer_name]:
-        cfg["LayerName"][layer_name]["Precision"] = {}
-    cfg["LayerName"][layer_name]["Precision"]["accum"] = prec
+# ── Build config (single source of truth: bnjettag/hls_precision.py) ──────────
+# Identical io_parallel precision to hls_convert_v2.py / hls_trace.py — the same
+# config the C-sim was verified against, so synthesis can't drift from it.
+cfg = build_hls_config(model, io_type="io_parallel")
+cfg["Model"]["ReuseFactor"] = 64  # RF=64 prevents the HLS scheduler crash
 
 # ── Convert (regenerate project files) ───────────────────────────────────────
 print("Converting...")

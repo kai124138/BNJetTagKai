@@ -1,9 +1,12 @@
 # BNJetTagKai
 
 > **Contributing (humans and LLMs): read [`RULES.md`](RULES.md) first.** It is
-> the required workflow + version-control contract for this repo. Current status
-> and what to do next live in [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md); session
-> patch notes are in [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
+> the required workflow + version-control contract for this repo. Then skim
+> [`docs/REPO_MAP.md`](docs/REPO_MAP.md) (one-line index of every file) to orient
+> without reading code. Current status and what to do next live in
+> [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md); session patch notes are in
+> [`docs/CHANGELOG.md`](docs/CHANGELOG.md); non-obvious decisions and settled
+> questions are in [`docs/GLOSSARY.md`](docs/GLOSSARY.md).
 
 A 1-bit (BitNet-style) jet tagger for the CMS L1 trigger, trained on Russell's
 4c/4b dataset and being prepared for FPGA deployment via hls4ml.
