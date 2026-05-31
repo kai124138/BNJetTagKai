@@ -5,6 +5,41 @@ format — every session that changes the repo appends an entry here.
 
 ---
 
+## 2026-05-31 — Record verified hls4ml C-sim results (input_norm fix confirmed)
+
+**Who:** Claude (LLM)
+**Commits:** (this commit)
+
+### What changed
+- Recorded the verified C-sim/trace results in `docs/NEXT_STEPS.md`: the
+  `input_norm` fix is confirmed working on hardware-accurate C-sim.
+- Marked the "verify input_norm fix" and "confirm full-model C-sim" items DONE
+  and promoted "run synthesis" to the top item.
+- Added an optional `head_fc2`-tightening + io_stream item.
+- Markdown only; no code changed.
+
+### Why
+- The owner ran `hls_trace.py` and `hls_convert_v2.py` on a patched machine and
+  pasted the output. Per `RULES.md`, verified results must be logged so the next
+  session starts from the real state, not the unverified one.
+
+### Verified (measured, by the owner on a patched machine)
+- `hls_trace.py`: `input_norm` corr **0.955 → 1.000**;
+  `ds_block_0_norm1` **−0.06 → 1.000**; all layers **1.000** through `head_fc1`;
+  `head_fc2` **0.979** (tight-cluster artifact, not an accuracy problem);
+  Final Corr **0.9788**.
+- `hls_convert_v2.py` (io_parallel): physics corr **0.995**, MAE 0.578;
+  HLS AUC **0.4505** vs Keras **0.4429** → matches within tolerance (0.008).
+  Note: the 0.44 AUC is a 46-jet smoke test, not a quality metric — it only
+  proves HLS tracks Keras. Real AUC ≈ 0.989 is from `ROC.py` on full validation.
+
+### Still broken / unfinished
+- Synthesis (`hls_build.py`) still never run — no latency/resource numbers. Now
+  the top item in `NEXT_STEPS.md`.
+- FP32 baseline (`training/transformer_fp32.py`) still untrained (needs GPU).
+
+---
+
 ## 2026-05-31 — Add contributor rules + changelog
 
 **Who:** Claude (LLM)

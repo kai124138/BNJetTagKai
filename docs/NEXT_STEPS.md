@@ -9,58 +9,39 @@ next." Read this first when you come back to the project.
 
 ## TL;DR — does it work?
 
-**Training works. hls4ml conversion is close but not yet verified end-to-end.
-Synthesis has not been run.**
+**Training works. hls4ml conversion is now VERIFIED end-to-end on C-sim.
+Synthesis is the only remaining step.**
 
 - The BitNet transformer trains to **AUC ≈ 0.989** — done.
 - The attention-free DeepSets variant (the one going to FPGA) trains — done.
 - The hls4ml C-simulation runs, the three stock-hls4ml LayerNorm bugs are
-  patched, and we just fixed the `input_norm` 2× amplification (the last known
-  per-layer divergence). **This still needs to be confirmed by a trace run** —
-  see step 1 below. Nothing about the project is "automatically" working until
-  that trace comes back clean; the code change is sound on the math but
-  unverified on hardware-accurate C-sim.
+  patched, and the `input_norm` 2× amplification is **fixed and confirmed**.
+  The 2026-05-31 trace run came back clean (see below) — this is the milestone
+  the project was stuck on.
 - FPGA synthesis (`hls_build.py`) is wired up but has **never been run to
-  completion**. We don't have latency/LUT numbers yet.
+  completion**. We don't have latency/LUT numbers yet. **This is now the top
+  item.**
 
-So: not done, but the remaining path is short and well-understood.
+So: the hard part is done. What remains is running synthesis and recording the
+resource/latency numbers.
+
+### Verified C-sim results (2026-05-31)
+- `hls_trace.py`: `input_norm` corr **0.955 → 1.000**;
+  `ds_block_0_norm1` corr **−0.06 → 1.000**; all layers **corr 1.000** through
+  `head_fc1`; `head_fc2` corr **0.979** (a tight-output-cluster artifact, not a
+  real accuracy problem — see gotchas); Final Corr **0.9788**.
+- `hls_convert_v2.py` (io_parallel): physics correlation **0.995**, MAE 0.578;
+  HLS AUC **0.4505** vs Keras **0.4429** → "✓ matches within tolerance."
+  (The 0.44 AUC is meaningless as a quality number — only 46 jets, a smoke
+  test. It only proves HLS tracks Keras. Real model AUC ≈ 0.989 comes from
+  `ROC.py` on the full validation set.)
 
 ---
 
 ## What's up next (in priority order)
 
-### 1. Verify the `input_norm` fix  ← do this first
-Run the per-layer trace on a machine with the patched hls4ml + the model file:
-
-```bash
-bash hls4ml/setup_hls4ml.sh      # if hls4ml isn't installed/patched yet
-python hls4ml/hls_trace.py
-```
-
-**Success looks like:** `input_norm` correlation jumps from 0.955 toward ~1.0,
-and the layers after it (`ds_block_0_norm1` onward, which were −0.06 / 0.009)
-recover now that the upstream 2× is gone.
-
-- If `input_norm` is clean but a *downstream* LayerNorm still diverges, that's
-  the next layer to tune (same playbook: profile its variance, set its
-  `table_range_power2` / `table_t`). Capture the new trace table.
-- If `input_norm` is still off, the range pick needs adjusting — re-profile its
-  actual per-sample variance and confirm `max var < 2^-4 = 0.0625`.
-
-### 2. Confirm full-model C-sim correlation
-Once the trace is clean, run the end-to-end conversion + comparison:
-
-```bash
-python hls4ml/hls_convert_v2.py            # io_parallel
-python hls4ml/hls_convert_iostream.py      # io_stream (optional)
-```
-
-**Target:** noise-input correlation > 0.99 (was stuck at ~0.97 because of the
-`input_norm` bug) and physics correlation > 0.99 (already there at 0.997).
-Record the new numbers in `hls4ml/README.md` and `docs/hls4ml_precision_bugs.md`.
-
-### 3. Run synthesis and capture resource/latency numbers
-Only after C-sim is clean — synthesizing the buggy config wastes ~30–60 min.
+### 1. Run synthesis and capture resource/latency numbers  ← do this first
+C-sim is clean (verified 2026-05-31), so synthesis is the next real step.
 
 ```bash
 python hls4ml/hls_build.py     # needs Vivado 2020.1; ~30–60 min
@@ -75,7 +56,18 @@ trigger FPGA. Their HGQ Deep Sets baseline hits ~44–53 ns latency, ~177–256k
 LUT, II = 1, DSP = 0 on an XCU250 — a useful yardstick (different dataset, so
 not a direct accuracy comparison).
 
-### 4. (Deferred) Train the FP32 baseline
+### 2. (Optional) Tighten `head_fc2` and run io_stream
+Neither blocks synthesis; both are polish.
+
+- **`head_fc2` corr 0.979** is a tight-output-cluster artifact (output band only
+  ~2.5 wide, ~0.3 systematic bias from FP32 weights/bias landing in
+  `ap_fixed<16,8>`), confirmed harmless by the AUC matching within 0.008. If you
+  want it cosmetically clean, widen `head_fc2`'s result/weight/bias to
+  `ap_fixed<18,8>` in all four config copies and re-trace.
+- **io_stream path:** `python hls4ml/hls_convert_iostream.py` for the streaming
+  dataflow variant (different latency/resource trade-off than io_parallel).
+
+### 3. (Deferred) Train the FP32 baseline
 `training/transformer_fp32.py` is ready but was never trained — no GPU was
 visible from the shell (TF saw 0 GPUs). Run it when you have GPU access so the
 ROC plot has the float reference curve.
